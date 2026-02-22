@@ -12,9 +12,31 @@ description: "Create a new GitHub Issue in `status:backlog` using the repo’s a
 ## Preconditions
 
 - Доступ к репозиторию и настроенный GitHub CLI: `gh auth status`.
-- Понятны: `type` (`feature|bug|chore|audit|spec`), `area`, короткое описание.
+- Достаточно контекста, чтобы заполнить: `type` (`feature|bug|chore|audit|spec`), `area`, короткое описание.
 
 ## Workflow
+
+### 0) Ask clarifying questions only if there are gaps
+
+**Правило:** задавать уточняющие вопросы *только* если без них нельзя корректно создать issue. Если информации достаточно — сразу создавать issue, а мелкие допущения фиксировать в `Notes:` как `Assumptions: ...`.
+
+Минимально необходимая информация:
+
+- `type`: что это — feature/bug/chore/audit/spec
+- `area`: короткий модуль/область в скобках (например, `sim`, `ui`, `robot`, `firmware`, `docs`)
+- 1–2 предложения описания сути
+
+Для `bug` дополнительно (если отсутствует — спросить):
+
+- `Observed:` что происходит
+- `Expected:` что должно происходить
+- (опционально) `Repro:` шаги/условия
+
+Если есть пробелы, задать **1–3** коротких вопроса и дождаться ответа. Пример:
+
+- “Это `bug` или `feature`?”
+- “Какой `area` поставить (например `sim`/`firmware`/`robot`/`ui`/`docs`)?“
+- “Для бага: что *Observed* и что *Expected*?”
 
 ### 1) Normalize the issue title
 
@@ -41,6 +63,7 @@ gh issue create --title "<title>" --body "<body>" --label "status:backlog"
 - `Why:` 2–5 строк мотивации
 - `Observed:` (для багов)
 - `Expected:` (для багов)
+- `Repro:` (для багов, если применимо)
 - `Notes:` контекст/ссылки/ограничения
 
 Если нужно поправить заголовок/лейблы после создания:
@@ -64,6 +87,7 @@ NEXT=plan <issue_number>
 ## Guardrails
 
 - `capture` не создаёт PR и не меняет код.
+- Не превращать `capture` в интервью: вопросы — только по явным пробелам, иначе фиксировать допущения в `Notes:`.
 - Если в репо нет лейбла `status:backlog`, явно сообщить об этом и продолжить без лейбла (или предложить создать лейбл).
 
 ## References

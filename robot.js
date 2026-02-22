@@ -121,7 +121,10 @@ class ColorSensor {
     );
     // Add some noise/unreliability to simulate real IR/color sensor
     if (Math.random() < 0.05) return false;
-    return sensorPos.len() >= zoneRadius - 0.02;
+    const dx = sensorPos.x - CFG.ZONE_CENTER_X;
+    const dy = sensorPos.y - CFG.ZONE_CENTER_Y;
+    const distFromCenter = Math.sqrt(dx * dx + dy * dy);
+    return distFromCenter >= zoneRadius - 0.02;
   }
 }
 
@@ -225,8 +228,14 @@ class Robot {
     this.pos.y   += Math.sin(this.heading) * linVel * dt;
 
     // Hard clamp inside zone
-    if (this.pos.len() > CFG.ZONE_RADIUS - CFG.ROBOT_RADIUS) {
-      this.pos.set(this.pos.norm().scale(CFG.ZONE_RADIUS - CFG.ROBOT_RADIUS));
+    const dx = this.pos.x - CFG.ZONE_CENTER_X;
+    const dy = this.pos.y - CFG.ZONE_CENTER_Y;
+    const distFromCenter = Math.sqrt(dx * dx + dy * dy);
+    if (distFromCenter > CFG.ZONE_RADIUS - CFG.ROBOT_RADIUS) {
+      const angle = Math.atan2(dy, dx);
+      const maxDist = CFG.ZONE_RADIUS - CFG.ROBOT_RADIUS;
+      this.pos.x = CFG.ZONE_CENTER_X + Math.cos(angle) * maxDist;
+      this.pos.y = CFG.ZONE_CENTER_Y + Math.sin(angle) * maxDist;
     }
 
     // Obstacle collisions (simple circle vs AABB)
@@ -236,8 +245,14 @@ class Robot {
         for (const o of obstacles) {
           resolveCircleVsAABB(this.pos, CFG.ROBOT_RADIUS, o.minX, o.minY, o.maxX, o.maxY);
         }
-        if (this.pos.len() > CFG.ZONE_RADIUS - CFG.ROBOT_RADIUS) {
-          this.pos.set(this.pos.norm().scale(CFG.ZONE_RADIUS - CFG.ROBOT_RADIUS));
+        const dx = this.pos.x - CFG.ZONE_CENTER_X;
+        const dy = this.pos.y - CFG.ZONE_CENTER_Y;
+        const distFromCenter = Math.sqrt(dx * dx + dy * dy);
+        if (distFromCenter > CFG.ZONE_RADIUS - CFG.ROBOT_RADIUS) {
+          const angle = Math.atan2(dy, dx);
+          const maxDist = CFG.ZONE_RADIUS - CFG.ROBOT_RADIUS;
+          this.pos.x = CFG.ZONE_CENTER_X + Math.cos(angle) * maxDist;
+          this.pos.y = CFG.ZONE_CENTER_Y + Math.sin(angle) * maxDist;
         }
       }
     }
