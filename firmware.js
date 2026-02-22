@@ -60,6 +60,7 @@ const RobotFirmware = {
 
       probeTimer: 0,
       probeToggleTimer: 0,
+      probeSampleTimer: 0,
       probeDir: 1,
       probeSamples: 0,
       probeInf: 0,
@@ -163,19 +164,23 @@ const RobotFirmware = {
       }
 
       // Sample at sensor rate during probe.
-      // Note: dist is the latest measurement; sensor model updates independently.
-      // We'll treat Infinity as a dropout.
-      if (Number.isFinite(dist)) {
-        threat.probeSamples++;
-        if (dist < threat.probeMin) threat.probeMin = dist;
-        if (dist > threat.probeMax) threat.probeMax = dist;
-        if (threat.probeLastFinite != null) {
-          threat.probeAbsDerivSum += Math.abs(dist - threat.probeLastFinite);
+      threat.probeSampleTimer += dt;
+      while (threat.probeSampleTimer >= THREAT_CFG.SAMPLE_DT) {
+        threat.probeSampleTimer -= THREAT_CFG.SAMPLE_DT;
+        // Note: dist is the latest measurement; sensor model updates independently.
+        // We'll treat Infinity as a dropout.
+        if (Number.isFinite(dist)) {
+          threat.probeSamples++;
+          if (dist < threat.probeMin) threat.probeMin = dist;
+          if (dist > threat.probeMax) threat.probeMax = dist;
+          if (threat.probeLastFinite != null) {
+            threat.probeAbsDerivSum += Math.abs(dist - threat.probeLastFinite);
+          }
+          threat.probeLastFinite = dist;
+        } else {
+          threat.probeSamples++;
+          threat.probeInf++;
         }
-        threat.probeLastFinite = dist;
-      } else {
-        threat.probeSamples++;
-        threat.probeInf++;
       }
 
       // Override motion: rotate in place.
@@ -200,6 +205,7 @@ const RobotFirmware = {
       threat.phase = 'idle';
       threat.probeTimer = 0;
       threat.probeToggleTimer = 0;
+      threat.probeSampleTimer = 0;
       threat.probeDir = 1;
       threat.probeSamples = 0;
       threat.probeInf = 0;
@@ -234,10 +240,17 @@ const RobotFirmware = {
       }
     }
 
+    // In states where the robot should remain stationary, do not initiate an
+    // active probe: rely only on the movement signature above.
+    if (robot.state === STATE.SLEEP || robot.state === STATE.LAYING) {
+      return { threat: false, override: false, enterAggression: false };
+    }
+
     // Otherwise start probe.
     threat.phase = 'probing';
     threat.probeTimer = 0;
     threat.probeToggleTimer = 0;
+    threat.probeSampleTimer = 0;
     threat.probeDir = 1;
     threat.probeSamples = 0;
     threat.probeInf = 0;
