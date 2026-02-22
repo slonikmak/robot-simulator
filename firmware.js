@@ -39,9 +39,11 @@ const THREAT_CFG = {
   WALL_AVOID_DUR: 0.9,
 
   // Heuristics tuned for metres and ULTRASONIC_NOISE ~ 0.02.
-  MOVING_ABS_DERIV: 0.10,    // m/sample, when robot is not driving forward
+  MOVING_ABS_DERIV: 0.07,    // m/sample, when robot is nearly stationary
   PROBE_DROPOUT_RATE: 0.20,  // % of samples that became Infinity during probe
   PROBE_SPREAD: 0.14,        // max-min during probe
+
+  SUSPECT_DUR: 0.35,
 };
 
 const RobotFirmware = {
@@ -57,6 +59,7 @@ const RobotFirmware = {
       phase: 'idle', // idle | probing | cooldown
       cooldown: 0,
       wallAvoid: 0,
+      suspect: 0,
 
       probeTimer: 0,
       probeToggleTimer: 0,
@@ -125,6 +128,7 @@ const RobotFirmware = {
     // Timers
     if (threat.cooldown > 0) threat.cooldown = Math.max(0, threat.cooldown - dt);
     if (threat.wallAvoid > 0) threat.wallAvoid = Math.max(0, threat.wallAvoid - dt);
+    if (threat.suspect > 0) threat.suspect = Math.max(0, threat.suspect - dt);
 
     const dist = robot.ultrasonic.lastMeasurement;
     const near = Number.isFinite(dist) && dist < THREAT_CFG.NEAR_DIST;
@@ -152,6 +156,24 @@ const RobotFirmware = {
         robot.pwmRight = -0.25;
         return { threat: false, override: true, enterAggression: false };
       }
+    }
+
+    // Suspect window: hold still briefly to observe real target motion.
+    if (threat.suspect > 0) {
+      robot.pwmLeft  = 0;
+      robot.pwmRight = 0;
+
+      const stats = this._ringStats(threat);
+      if (near && stats && stats.finiteN >= 3 && stats.absDerivMean >= THREAT_CFG.MOVING_ABS_DERIV) {
+        threat.suspect = 0;
+        return { threat: true, override: false, enterAggression: true };
+      }
+
+      // If suspect expires without movement, ignore as non-threat.
+      if (threat.suspect <= 0) {
+        threat.cooldown = THREAT_CFG.COOLDOWN_DUR;
+      }
+      return { threat: false, override: true, enterAggression: false };
     }
 
     // Probing phase (micro-rotation) to differentiate a small target vs a flat/static surface.
@@ -215,8 +237,10 @@ const RobotFirmware = {
       threat.probeAbsDerivSum = 0;
 
       if (legsScore >= 1) {
-        // “Moving legs” signature: intermittent + angle-sensitive.
-        return { threat: true, override: false, enterAggression: true };
+        // Not a wall-like surface (small/edge target). Do NOT attack yet:
+        // require real motion in the distance stream (R-011).
+        threat.suspect = THREAT_CFG.SUSPECT_DUR;
+        return { threat: false, override: true, enterAggression: false };
       }
 
       // Classified as static surface (wall/obstacle) – apply cooldown & optional avoid.
@@ -229,13 +253,12 @@ const RobotFirmware = {
     if (!near) return { threat: false, override: false, enterAggression: false };
     if (threat.cooldown > 0) return { threat: false, override: false, enterAggression: false };
 
-    // Fast-path: if the distance stream changes a lot while we are not driving forward,
-    // it's likely a moving target (legs) rather than a static wall.
+    // Fast-path: if the distance stream changes a lot while the robot is nearly
+    // stationary, it's likely a moving target (legs).
     const stats = this._ringStats(threat);
     if (stats && stats.finiteN >= 3) {
-      const drive = (robot.pwmLeft + robot.pwmRight) * 0.5;
-      const drivingForward = drive > 0.35;
-      if (!drivingForward && stats.absDerivMean >= THREAT_CFG.MOVING_ABS_DERIV) {
+      const nearlyStationary = Math.abs(robot.pwmLeft) < 0.18 && Math.abs(robot.pwmRight) < 0.18;
+      if (nearlyStationary && stats.absDerivMean >= THREAT_CFG.MOVING_ABS_DERIV) {
         return { threat: true, override: false, enterAggression: true };
       }
     }
