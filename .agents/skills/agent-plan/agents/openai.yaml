@@ -1,0 +1,4 @@
+interface:
+  display_name: "Агент: plan"
+  short_description: "Подготовка PR для Plan Gate и плана"
+  default_prompt: "Используй $agent-plan, чтобы подготовить plan-only PR для апрува плана."

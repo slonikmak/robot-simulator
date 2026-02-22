@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Симулятор выставочного робота</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+
+  <script src="firmware.js"></script>
+  <script src="robot.js"></script>
+
+  <div id="ui">
+    <div id="state-panel">
+      <div class="panel-title">🐞 Робот на выставке</div>
+
+      <div class="info-row">
+        <span class="info-key">Состояние:</span>
+        <span id="state-label" class="state-badge">—</span>
+      </div>
+      <div class="info-row">
+        <span class="info-key">Дальность ультразвука:</span>
+        <span id="dist-label">—</span>
+      </div>
+      <div class="info-row">
+        <span class="info-key">Кладок всего:</span>
+        <span id="clutch-count-label">0</span>
+      </div>
+      <div class="info-row">
+        <span class="info-key">Следующая кладка:</span>
+        <span id="lay-timer-label">—</span>
+      </div>
+      <div class="info-row">
+        <span class="info-key">Таймер состояния:</span>
+        <span id="timer-label">—</span>
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="control-row">
+        <label for="speed-slider" class="control-label">
+          Скорость симуляции:&nbsp;<strong id="speed-value">1×</strong>
+        </label>
+        <input type="range" id="speed-slider" min="1" max="60" value="1" step="1" />
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="hint">
+        <b>Управление</b><br/>
+        🖱 Курсор = ноги посетителя<br/>
+        🔄 Колёсико = зум<br/>
+        ⚡ Слайдер = ускорение времени
+      </div>
+    </div>
+  </div>
+
+  <script src="main.js"></script>
+</body>
+</html>

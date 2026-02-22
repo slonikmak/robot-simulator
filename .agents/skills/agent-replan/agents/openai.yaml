@@ -1,0 +1,4 @@
+interface:
+  display_name: "Агент: replan"
+  short_description: "Обновление плана после changes requested"
+  default_prompt: "Используй $agent-replan, чтобы обновить tasks/spec и вернуть PR на plan review."

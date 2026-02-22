@@ -1,0 +1,117 @@
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  background: #1a1a2e;
+  overflow: hidden;
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  color: #e0e0e0;
+}
+
+#canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: none;
+}
+
+/* UI Panel */
+#ui {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  pointer-events: none;
+  z-index: 10;
+}
+
+#state-panel {
+  background: rgba(10, 10, 30, 0.82);
+  border: 1px solid rgba(100, 150, 255, 0.25);
+  border-radius: 12px;
+  padding: 14px 16px;
+  width: 240px;
+  backdrop-filter: blur(8px);
+  pointer-events: auto;
+  box-shadow: 0 4px 24px rgba(0,0,0,0.5);
+}
+
+.panel-title {
+  font-size: 1rem;
+  font-weight: 700;
+  margin-bottom: 10px;
+  color: #a0c4ff;
+  letter-spacing: 0.02em;
+}
+
+.info-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.78rem;
+  margin-bottom: 5px;
+  gap: 6px;
+}
+
+.info-key {
+  color: #888;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.state-badge {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 20px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  background: rgba(255,255,255,0.08);
+  color: #fff;
+  text-align: right;
+  transition: background 0.3s;
+}
+
+.state-badge.sleep      { background: #2c3e50; color: #7fb3d3; }
+.state-badge.safe       { background: #1e4d2b; color: #6fcf97; }
+.state-badge.laying     { background: #4a2c6a; color: #c19fff; }
+.state-badge.aggression { background: #5a1a1a; color: #ff6b6b; }
+.state-badge.retreat    { background: #3a2a10; color: #f5a623; }
+.state-badge.guard      { background: #1a3a4a; color: #4fc3f7; }
+.state-badge.calming    { background: #2a3a20; color: #a5d6a7; }
+
+.divider {
+  border-top: 1px solid rgba(255,255,255,0.08);
+  margin: 10px 0;
+}
+
+.control-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 0.78rem;
+}
+
+.control-label {
+  color: #aaa;
+}
+
+#speed-slider {
+  width: 100%;
+  accent-color: #a0c4ff;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.hint {
+  font-size: 0.72rem;
+  color: #666;
+  line-height: 1.6;
+}
+
+.hint b {
+  color: #888;
+}

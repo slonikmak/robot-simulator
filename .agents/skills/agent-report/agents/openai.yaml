@@ -1,0 +1,4 @@
+interface:
+  display_name: "Агент: report"
+  short_description: "Сводка FSM по задачам и PR"
+  default_prompt: "Используй $agent-report, чтобы вывести сводку статусов по проекту или issue."

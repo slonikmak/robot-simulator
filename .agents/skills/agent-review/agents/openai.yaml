@@ -1,0 +1,4 @@
+interface:
+  display_name: "Агент: review"
+  short_description: "Проверка PR и acceptance перед merge"
+  default_prompt: "Используй $agent-review, чтобы проверить PR body и готовность к merge."
