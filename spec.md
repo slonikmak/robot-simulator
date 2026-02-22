@@ -73,3 +73,4 @@
 ## Requirements
 
 - **R-010**: The simulation environment shall be bounded by four walls forming a rectangular room of 20 by 10 meters, centered at (0,0).
+- **R-011**: The robot firmware shall treat only *moving* objects consistent with human legs as a threat: it must not enter AGGRESSION solely due to static walls/obstacles. The decision must be based only on the ultrasonic distance stream (HC-SR04-like) plus the robot’s own motion/commands (no map/world geometry).
