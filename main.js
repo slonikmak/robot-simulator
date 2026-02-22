@@ -185,6 +185,14 @@ class Renderer {
     return new Vec2(r.x, r.y);
   }
 
+  // version that writes into an existing Vec2 to avoid allocation
+  _w2sInto(v, out) {
+    const r = worldToScreen(v.x, v.y, this.canvas);
+    out.x = r.x;
+    out.y = r.y;
+    return out;
+  }
+
   // ── Draw zone ─────────────────────────────────────────
   drawZone() {
     // this function now only paints to current ctx; called by _renderStatic
@@ -286,7 +294,8 @@ class Renderer {
     clutches.forEach((clutch, ci) => {
       const isActive = ci === activeIdx;
       clutch.eggs.forEach(egg => {
-        const sp = this.w2s(egg.pos);
+        const sp = this._tmpV1;
+        this._w2sInto(egg.pos, sp);
         const r  = this.mToPx(egg.radius);
         const prevAlpha = this.ctx.globalAlpha;
         this.ctx.globalAlpha = egg.alpha * 0.92;
@@ -318,7 +327,8 @@ class Renderer {
   // ── Draw flying egg particles ─────────────────────────
   drawParticles(particles) {
     particles.forEach(p => {
-      const sp = this.w2s(p.pos);
+      const sp = this._tmpV1;
+      this._w2sInto(p.pos, sp);
       const r  = this.mToPx(p.r);
       const alpha = (1 - p.t) * 0.9;
       const prevAlpha = this.ctx.globalAlpha;
@@ -346,12 +356,17 @@ class Renderer {
     this._staticCanvas = document.createElement('canvas');
     this._staticZoom   = null;
     this._staticSize   = { w: 0, h: 0 };
+
+    // scratch vectors to avoid frequent allocations
+    this._tmpV1 = new Vec2();
+    this._tmpV2 = new Vec2();
   }
 
   drawRobot(robot) {
     const ctx  = this.ctx;
     const pos  = robot.pos.add(robot.vibrate);
-    const sp   = this.w2s(pos);
+    const sp   = this._tmpV1;
+    this._w2sInto(pos, sp);
     const R    = this.mToPx(CFG.ROBOT_RADIUS);
     const h    = robot.heading;
     const s    = this.scale;
@@ -545,7 +560,8 @@ class Renderer {
 
   // ── Draw "legs" cursor ────────────────────────────────
   drawLegs(legsPos) {
-    const sp  = this.w2s(legsPos);
+    const sp  = this._tmpV1;
+    this._w2sInto(legsPos, sp);
     const ctx = this.ctx;
     const r   = this.mToPx(0.06);
     const now = performance.now() / 1000;
