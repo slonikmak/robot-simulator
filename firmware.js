@@ -28,7 +28,7 @@ const RobotFirmware = {
     robot.stateTimer = 0;
 
     if (newState === STATE.AGGRESSION) {
-      robot.lungePhase   = 'drive';
+      robot.lungePhase   = null;
       robot.lungeTimer   = 0;
       robot.lungeDriveTime = 0;
     }

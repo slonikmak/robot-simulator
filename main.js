@@ -278,15 +278,18 @@ class Renderer {
     ctx.stroke();
     ctx.setLineDash([]);
 
-    // Inner safety "trigger" ring (faint, 0.5m from boundary)
-    const Ri = this.mToPx(CFG.ZONE_RADIUS - CFG.WAKE_DIST_FROM_BOUNDARY);
-    ctx.beginPath();
-    ctx.arc(c.x, c.y, Ri, 0, 2 * Math.PI);
-    ctx.strokeStyle = 'rgba(255,100,100,0.14)';
-    ctx.lineWidth   = 1.5;
-    ctx.setLineDash([this.mToPx(0.1), this.mToPx(0.12)]);
-    ctx.stroke();
-    ctx.setLineDash([]);
+    // Inner safety "trigger" ring (faint) – only if wake distance < zone radius
+    const wakeRi = CFG.ZONE_RADIUS - CFG.WAKE_DIST_FROM_BOUNDARY;
+    if (wakeRi > 0) {
+      const Ri = this.mToPx(wakeRi);
+      ctx.beginPath();
+      ctx.arc(c.x, c.y, Ri, 0, 2 * Math.PI);
+      ctx.strokeStyle = 'rgba(255,100,100,0.14)';
+      ctx.lineWidth   = 1.5;
+      ctx.setLineDash([this.mToPx(0.1), this.mToPx(0.12)]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
 
     // Labels
     const labelR = R + this.mToPx(0.12);

@@ -175,9 +175,9 @@ class Robot {
     this.currentLayingClutch = null;
 
     // Aggression sub-state
-    this.lungeTarget      = null;
-    this.lungePhase       = 'drive'; // 'drive' | 'back'
-    this.lungeOrigin      = null;
+    this.lungePhase       = null;
+    this.lungeTimer       = 0;
+    this.lungeDriveTime   = 0;
 
     // Calming
     this.calmTimer        = 0;
@@ -193,6 +193,9 @@ class Robot {
     // Guard jitter
     this.jitterTimer = 0;
     this.jitterTarget = null;
+
+    // Boundary avoidance timer
+    this.boundaryAvoidTimer = 0;
 
     // Visual
     this.vibrate = new Vec2(0, 0); // vibration offset
