@@ -167,6 +167,20 @@ class Renderer {
   constructor(canvas) {
     this.canvas = canvas;
     this.ctx    = canvas.getContext('2d');
+
+    // cache gradients per zoom
+    this._cachedZoom = null;
+    this._bodyGrad   = null;
+    this._headGrad   = null;
+
+    // offscreen buffer for static elements (zone + walls)
+    this._staticCanvas = document.createElement('canvas');
+    this._staticZoom   = null;
+    this._staticSize   = { w: 0, h: 0 };
+
+    // scratch vectors to avoid frequent allocations
+    this._tmpV1 = new Vec2();
+    this._tmpV2 = new Vec2();
   }
 
   resize() {
@@ -345,23 +359,6 @@ class Renderer {
   }
 
   // ── Draw robot (ladybug, top view) ───────────────────
-  constructor(canvas) {
-    this.canvas = canvas;
-    this.ctx    = canvas.getContext('2d');
-    this._cachedZoom = null;
-    this._bodyGrad   = null;
-    this._headGrad   = null;
-
-    // offscreen buffer for static elements (zone + walls)
-    this._staticCanvas = document.createElement('canvas');
-    this._staticZoom   = null;
-    this._staticSize   = { w: 0, h: 0 };
-
-    // scratch vectors to avoid frequent allocations
-    this._tmpV1 = new Vec2();
-    this._tmpV2 = new Vec2();
-  }
-
   drawRobot(robot) {
     const ctx  = this.ctx;
     const pos  = robot.pos.add(robot.vibrate);
@@ -652,10 +649,13 @@ class Renderer {
       // paint background fill first so zone ring still overlays it
       ctx.fillStyle = '#16162a';
       ctx.fillRect(0, 0, zc.width, zc.height);
+
+      const prevCtx = this.ctx;
       this.ctx = ctx; // temporarily direct drawZone/Obstacles here
       this.drawZone();
       this.drawObstacles(obstacles);
-      this.ctx = this.canvas.getContext('2d');
+      this.ctx = prevCtx;
+
       this._staticZoom = camera.zoom;
     }
   }
@@ -667,11 +667,6 @@ class Renderer {
     this._renderStatic(obstacles);
     ctx.drawImage(this._staticCanvas, 0, 0);
 
-    this.drawClutches(robot.clutches, robot.activeClutchIdx);
-    this.drawParticles(robot.particles);
-    this.drawRobot(robot);
-    this.drawLegs(legsPos);
-    this.drawScaleBar();
     this.drawClutches(robot.clutches, robot.activeClutchIdx);
     this.drawParticles(robot.particles);
     this.drawRobot(robot);
