@@ -119,6 +119,8 @@ class ColorSensor {
     const sensorPos = this._robot.pos.add(
       Vec2.fromAngle(this._robot.heading, CFG.COLOR_SENSOR_DIST)
     );
+    // Add some noise/unreliability to simulate real IR/color sensor
+    if (Math.random() < 0.05) return false;
     return sensorPos.len() >= zoneRadius - 0.02;
   }
 }
@@ -173,9 +175,9 @@ class Robot {
     this.currentLayingClutch = null;
 
     // Aggression sub-state
-    this.lungeTarget      = null;
-    this.lungePhase       = 'drive'; // 'drive' | 'back'
-    this.lungeOrigin      = null;
+    this.lungePhase       = null;
+    this.lungeTimer       = 0;
+    this.lungeDriveTime   = 0;
 
     // Calming
     this.calmTimer        = 0;
@@ -192,6 +194,9 @@ class Robot {
     this.jitterTimer = 0;
     this.jitterTarget = null;
 
+    // Boundary avoidance timer
+    this.boundaryAvoidTimer = 0;
+
     // Visual
     this.vibrate = new Vec2(0, 0); // vibration offset
   }
@@ -206,7 +211,7 @@ class Robot {
 
     // ── Boundary override (colour sensor) ──────────────
     if (this.state !== STATE.SLEEP) {
-      RobotFirmware.applyBoundaryRepulsion(this);
+      RobotFirmware.applyBoundaryRepulsion(this, dt);
     }
 
     // ── Integrate differential drive kinematics ─────────

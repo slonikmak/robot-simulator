@@ -1,0 +1,92 @@
+name: Enforce PR body (Fixes + Spec + Plan + Why)
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  enforce:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require Fixes/Spec/Plan/Why when code changes
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pull_number = pr.number;
+
+            // Config
+            const CODE_PATH_PREFIXES = ["src/", "tests/"];
+
+            // If you want to exempt chore/docs/spec PRs based on title prefix:
+            const EXEMPT_KINDS = new Set(["chore", "docs", "spec"]);
+
+            function getKindFromTitle(title) {
+              const m = (title || "").match(/^([a-z]+)\s*\(/i);
+              return m ? m[1].toLowerCase() : null;
+            }
+
+            async function listChangedFiles() {
+              const files = [];
+              let page = 1;
+              while (true) {
+                const resp = await github.rest.pulls.listFiles({
+                  owner, repo, pull_number,
+                  per_page: 100,
+                  page
+                });
+                for (const f of resp.data) files.push(f.filename);
+                if (resp.data.length < 100) break;
+                page += 1;
+              }
+              return files;
+            }
+
+            function touchesCode(files) {
+              return files.some(fn => CODE_PATH_PREFIXES.some(p => fn.startsWith(p)));
+            }
+
+            const kind = getKindFromTitle(pr.title);
+            if (kind && EXEMPT_KINDS.has(kind)) {
+              core.info(`PR kind "${kind}" is exempt from body requirements.`);
+              return;
+            }
+
+            const files = await listChangedFiles();
+            if (!touchesCode(files)) {
+              core.info("No src/tests changes; body requirements not enforced.");
+              return;
+            }
+
+            const body = pr.body || "";
+
+            const hasFixes = /(^|\n)\s*Fixes\s+#\d+\b/i.test(body);
+            const hasSpec  = /(^|\n)\s*Spec:\s*(R-\d{3,}(\b|$)|New requirements?\b)/i.test(body);
+            const hasPlan  = /(^|\n)\s*Plan:\s*tasks\/T-\d+\.md\b/i.test(body);
+            const hasWhy   = /(^|\n)\s*Why:\s*\S+/i.test(body);
+
+            const missing = [];
+            if (!hasFixes) missing.push("Fixes #<issue>");
+            if (!hasSpec)  missing.push("Spec: R-XXX (or Spec: New requirement)");
+            if (!hasPlan)  missing.push("Plan: tasks/T-XXXX.md");
+            if (!hasWhy)   missing.push("Why: ...");
+
+            if (missing.length) {
+              core.setFailed(
+                `PR description is missing required fields for code/test changes:\n` +
+                missing.map(x => `- ${x}`).join("\n") +
+                `\n\nExample:\n` +
+                `Fixes #123\n` +
+                `Spec: R-013\n` +
+                `Plan: tasks/T-0123.md\n` +
+                `\nWhy:\n- ...`
+              );
+            } else {
+              core.info("OK: PR body contains Fixes + Spec + Plan + Why.");
+            }
