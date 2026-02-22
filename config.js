@@ -48,7 +48,7 @@ const CFG = {
   COLOR_SENSOR_DIST:    0.06, // m – sensor is this far ahead of robot center
 
   // Trigger distances (metres)
-  WAKE_DIST_FROM_BOUNDARY:  3.0,  // legs this close → robot wakes/activates
+  WAKE_DIST_FROM_BOUNDARY:  1.5,  // legs this close → robot wakes/activates
   LUNGE_AMPLITUDE_MIN:      0.50,
   LUNGE_AMPLITUDE_MAX:      1.0,
 
