@@ -125,6 +125,10 @@ const RobotFirmware = {
     this._ensureThreatState(robot);
     const threat = robot._threat;
 
+    // Defensive: if dt spikes (tab inactive) or becomes non-finite, avoid
+    // unbounded catch-up loops that can freeze the UI.
+    const dtSample = Number.isFinite(dt) ? Math.min(dt, 0.25) : 0;
+
     // Timers
     if (threat.cooldown > 0) threat.cooldown = Math.max(0, threat.cooldown - dt);
     if (threat.wallAvoid > 0) threat.wallAvoid = Math.max(0, threat.wallAvoid - dt);
@@ -134,9 +138,9 @@ const RobotFirmware = {
     const near = Number.isFinite(dist) && dist < THREAT_CFG.NEAR_DIST;
 
     // Keep a sensor-rate ring buffer (so we don't overweight render-frame dt).
-    threat.sampleTimer += dt;
-    while (threat.sampleTimer >= THREAT_CFG.SAMPLE_DT) {
-      threat.sampleTimer -= THREAT_CFG.SAMPLE_DT;
+    threat.sampleTimer += dtSample;
+    if (threat.sampleTimer >= THREAT_CFG.SAMPLE_DT) {
+      threat.sampleTimer = 0;
       this._pushThreatSample(threat, dist);
     }
 
@@ -186,9 +190,9 @@ const RobotFirmware = {
       }
 
       // Sample at sensor rate during probe.
-      threat.probeSampleTimer += dt;
-      while (threat.probeSampleTimer >= THREAT_CFG.SAMPLE_DT) {
-        threat.probeSampleTimer -= THREAT_CFG.SAMPLE_DT;
+      threat.probeSampleTimer += dtSample;
+      if (threat.probeSampleTimer >= THREAT_CFG.SAMPLE_DT) {
+        threat.probeSampleTimer = 0;
         // Note: dist is the latest measurement; sensor model updates independently.
         // We'll treat Infinity as a dropout.
         if (Number.isFinite(dist)) {
