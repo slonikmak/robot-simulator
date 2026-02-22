@@ -9,7 +9,7 @@
 // ── Tuneable constants ────────────────────────────────────────
 const CFG = {
   // World
-  ZONE_RADIUS:   1.25,  // m  – habitat zone radius (диаметр 2.5 м)
+  ZONE_RADIUS:   2.0,   // m  – habitat zone radius (диаметр 4.0 м)
   ROBOT_RADIUS:  0.15,  // m  – robot body radius (30 cm ⌀)
   WHEEL_BASE:    0.28,  // m  – distance between driven wheels
 
@@ -44,11 +44,11 @@ const CFG = {
   ULTRASONIC_RANGE:     3.0,  // m
   ULTRASONIC_NOISE:     0.02, // m std-dev noise
   ULTRASONIC_HZ:        15,   // update frequency
-  ULTRASONIC_FOV:       Math.PI * 0.33, // rad (~±30°) valid detection cone
+  ULTRASONIC_FOV:       Math.PI * (15 / 180), // rad (15°) valid detection cone
   COLOR_SENSOR_DIST:    0.06, // m – sensor is this far ahead of robot center
 
   // Trigger distances (metres)
-  WAKE_DIST_FROM_BOUNDARY:  1.0,  // legs this close → robot wakes/activates
+  WAKE_DIST_FROM_BOUNDARY:  3.0,  // legs this close → robot wakes/activates
   LUNGE_AMPLITUDE_MIN:      0.25,
   LUNGE_AMPLITUDE_MAX:      0.50,
 
@@ -293,7 +293,7 @@ class Renderer {
     ctx.font      = `${Math.max(10, this.mToPx(0.11))}px 'Segoe UI',sans-serif`;
     ctx.fillStyle = '#e8c84a88';
     ctx.textAlign = 'center';
-    ctx.fillText('⌀ 2.5 м (зона обитания)', c.x, c.y - labelR);
+    ctx.fillText('⌀ 4.0 м (зона обитания)', c.x, c.y - labelR);
   }
 
   // ── Draw obstacles ───────────────────────────────────

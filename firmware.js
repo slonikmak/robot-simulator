@@ -28,13 +28,12 @@ const RobotFirmware = {
     robot.stateTimer = 0;
 
     if (newState === STATE.AGGRESSION) {
-      robot.lungeTarget  = null;
-      robot.lungeOrigin  = robot.pos.clone();
       robot.lungePhase   = 'drive';
+      robot.lungeTimer   = 0;
+      robot.lungeDriveTime = 0;
     }
     if (newState === STATE.GUARD) {
       robot.jitterTimer  = 0;
-      robot.jitterTarget = null;
     }
     if (newState === STATE.LAYING) {
       robot.layingStep      = 0;
@@ -59,23 +58,8 @@ const RobotFirmware = {
   },
 
   startNextClutch(robot) {
-    let cx, cy;
-    if (robot.clutches.length === 0) {
-      const a = Math.random() * 2 * Math.PI;
-      const r = randBetween(0.4, 1.2);
-      cx = Math.cos(a) * r;
-      cy = Math.sin(a) * r;
-    } else {
-      const last = robot.clutches[robot.clutches.length - 1].center;
-      const a = Math.random() * 2 * Math.PI;
-      cx = last.x + Math.cos(a) * CFG.CLUTCH_OFFSET * (robot.layingStep + 1);
-      cy = last.y + Math.sin(a) * CFG.CLUTCH_OFFSET * (robot.layingStep + 1);
-    }
-
-    const v = new Vec2(cx, cy);
-    if (v.len() > CFG.ZONE_RADIUS - 0.3) v.set(v.norm().scale(CFG.ZONE_RADIUS - 0.3));
-
-    robot.currentLayingClutch = new Clutch(v.x, v.y);
+    // Lay clutch at current position (relative logic)
+    robot.currentLayingClutch = new Clutch(robot.pos.x, robot.pos.y);
     robot.clutches.push(robot.currentLayingClutch);
     robot.activeClutchIdx = robot.clutches.length - 1;
     robot.layingEggsLeft  = CFG.EGGS_PER_CLUTCH;
@@ -94,15 +78,8 @@ const RobotFirmware = {
   layPostCalmClutch(robot) {
     if (robot.activeClutchIdx < 0) return;
 
-    const prev = robot.clutches[robot.activeClutchIdx].center;
-    const a    = Math.random() * 2 * Math.PI;
-    const cx   = prev.x + Math.cos(a) * CFG.CLUTCH_OFFSET;
-    const cy   = prev.y + Math.sin(a) * CFG.CLUTCH_OFFSET;
-    const v    = new Vec2(cx, cy);
-
-    if (v.len() > CFG.ZONE_RADIUS - 0.25) v.set(v.norm().scale(CFG.ZONE_RADIUS - 0.25));
-
-    const clutch = new Clutch(v.x, v.y);
+    // Lay clutch at current position
+    const clutch = new Clutch(robot.pos.x, robot.pos.y);
     for (let i = 0; i < CFG.EGGS_PER_CLUTCH; i++) clutch.addEgg();
     robot.clutches.push(clutch);
     robot.activeClutchIdx = robot.clutches.length - 1;
@@ -110,43 +87,17 @@ const RobotFirmware = {
     this.spawnEggParticles(robot, clutch.center, 6);
   },
 
-  gotoPoint(robot, target, speed = 1.0, reverse = false) {
-    const toTarget = target.sub(robot.pos);
-    const dist     = toTarget.len();
-    if (dist < 0.04) return { left: 0, right: 0, arrived: true };
-
-    let desiredHeading = toTarget.angle();
-    if (reverse) desiredHeading = normaliseAngle(desiredHeading + Math.PI);
-
-    const headingErr = normaliseAngle(desiredHeading - robot.heading);
-    const kP_ang     = 2.5;
-    const angCmd     = clamp(headingErr * kP_ang, -1, 1);
-
-    const forwardFraction = reverse ? -1 : 1;
-    const fwdScale        = Math.max(0, 1 - Math.abs(headingErr) / (Math.PI * 0.6));
-    const linCmd          = forwardFraction * speed * fwdScale;
-
-    const left  = clamp(linCmd - angCmd * 0.5, -1, 1);
-    const right = clamp(linCmd + angCmd * 0.5, -1, 1);
-    return { left, right, arrived: false };
-  },
-
-  faceTarget(robot, target) {
-    const toTarget     = target.sub(robot.pos);
-    const desiredAngle = toTarget.angle();
-    const err          = normaliseAngle(desiredAngle - robot.heading);
-    const angCmd       = clamp(err * 3.0, -1, 1);
-    return { left: -angCmd * 0.45, right: angCmd * 0.45 };
-  },
-
-  applyBoundaryRepulsion(robot) {
+  applyBoundaryRepulsion(robot, dt) {
+    if (robot.boundaryAvoidTimer > 0) {
+      robot.boundaryAvoidTimer -= dt;
+      robot.pwmLeft  = -0.6;
+      robot.pwmRight = -0.2;
+      return true;
+    }
     if (robot.colorSensor.read(CFG.ZONE_RADIUS)) {
-      const toCenter = new Vec2(-robot.pos.x, -robot.pos.y).norm();
-      const desired  = toCenter.angle();
-      const err      = normaliseAngle(desired - robot.heading);
-      const ang      = clamp(err * 3.0, -1, 1);
-      robot.pwmLeft  = clamp(-0.6 - ang * 0.5, -1, 1);
-      robot.pwmRight = clamp(-0.6 + ang * 0.5, -1, 1);
+      robot.boundaryAvoidTimer = 1.5;
+      robot.pwmLeft  = -0.6;
+      robot.pwmRight = -0.2;
       return true;
     }
     return false;
@@ -180,19 +131,12 @@ const RobotFirmware = {
           robot.clutchesThisCycle = 0;
           this.enter(robot, STATE.LAYING);
         }
-        {
-          const target = robot.activeClutchIdx >= 0
-            ? robot.clutches[robot.activeClutchIdx].center
-            : new Vec2(0, 0);
-          const toDst = robot.pos.distTo(target);
-          if (toDst > 0.35) {
-            const m = this.gotoPoint(robot, target, 0.4);
-            robot.pwmLeft  = m.left;
-            robot.pwmRight = m.right;
-          } else {
-            robot.pwmLeft  = 0;
-            robot.pwmRight = 0;
-          }
+        // Wander slowly
+        robot.pwmLeft  = 0.3;
+        robot.pwmRight = 0.3;
+        if (Math.random() < 0.02) {
+          robot.pwmLeft += (Math.random() - 0.5) * 0.4;
+          robot.pwmRight += (Math.random() - 0.5) * 0.4;
         }
         break;
 
@@ -202,35 +146,30 @@ const RobotFirmware = {
           this.enter(robot, STATE.AGGRESSION);
           break;
         }
-        {
-          const tgt = robot.currentLayingClutch.center;
-          const m   = this.gotoPoint(robot, tgt, 0.5);
-          robot.pwmLeft  = m.left;
-          robot.pwmRight = m.right;
+        
+        robot.pwmLeft  = 0;
+        robot.pwmRight = 0;
 
-          robot.layingEggTimer += dt;
-          if (robot.layingEggsLeft > 0 && robot.layingEggTimer >= 0.18) {
-            robot.layingEggTimer -= 0.18;
-            robot.currentLayingClutch.addEgg();
-            robot.layingEggsLeft--;
-            const offset = Vec2.fromAngle(Math.random() * 2 * Math.PI, CFG.ROBOT_RADIUS * 0.9);
-            robot.particles.push(new EggParticle(robot.pos.add(offset), tgt));
-          }
+        robot.layingEggTimer += dt;
+        if (robot.layingEggsLeft > 0 && robot.layingEggTimer >= 0.18) {
+          robot.layingEggTimer -= 0.18;
+          robot.currentLayingClutch.addEgg();
+          robot.layingEggsLeft--;
+          const offset = Vec2.fromAngle(Math.random() * 2 * Math.PI, CFG.ROBOT_RADIUS * 0.9);
+          robot.particles.push(new EggParticle(robot.pos.add(offset), robot.currentLayingClutch.center));
+        }
 
-          if (robot.layingEggsLeft <= 0) {
-            robot.layingSubTimer += dt;
-            robot.pwmLeft  = 0;
-            robot.pwmRight = 0;
-            if (robot.layingSubTimer >= CFG.INTER_CLUTCH_DELAY) {
-              robot.layingSubTimer = 0;
-              robot.layingStep++;
-              if (robot.layingStep < CFG.CLUTCH_COUNT) {
-                robot.clutchesThisCycle++;
-                this.startNextClutch(robot);
-              } else {
-                robot.isBuzzing = false;
-                this.enter(robot, STATE.SLEEP);
-              }
+        if (robot.layingEggsLeft <= 0) {
+          robot.layingSubTimer += dt;
+          if (robot.layingSubTimer >= CFG.INTER_CLUTCH_DELAY) {
+            robot.layingSubTimer = 0;
+            robot.layingStep++;
+            if (robot.layingStep < CFG.CLUTCH_COUNT) {
+              robot.clutchesThisCycle++;
+              this.startNextClutch(robot);
+            } else {
+              robot.isBuzzing = false;
+              this.enter(robot, STATE.SLEEP);
             }
           }
         }
@@ -241,53 +180,46 @@ const RobotFirmware = {
           this.enter(robot, STATE.RETREATING);
           break;
         }
-        if (!legsPresent && robot.stateTimer > 3) {
-          this.enter(robot, STATE.RETREATING);
+        if (!legsPresent) {
+          // Search behavior (rotation) when target is lost
+          robot.pwmLeft = -0.5;
+          robot.pwmRight = 0.5;
+          if (robot.stateTimer > 3) {
+            this.enter(robot, STATE.RETREATING);
+          }
           break;
         }
-        if (!robot.lungeTarget || robot.lungePhase === 'done') {
-          // without bearing info pick a random offset from current heading
-          const baseAng = robot.heading;
-          const spread  = Math.PI * 0.35;
-          const a       = baseAng + randBetween(-spread, spread);
-          const amp     = randBetween(CFG.LUNGE_AMPLITUDE_MIN, CFG.LUNGE_AMPLITUDE_MAX);
-          const raw     = robot.pos.add(Vec2.fromAngle(a, amp));
-          if (raw.len() > CFG.ZONE_RADIUS - 0.18) raw.set(raw.norm().scale(CFG.ZONE_RADIUS - 0.18));
-          robot.lungeTarget = raw;
-          robot.lungeOrigin = robot.pos.clone();
-          robot.lungePhase  = 'drive';
+        
+        if (!robot.lungePhase || robot.lungePhase === 'done') {
+          robot.lungePhase = 'drive';
+          robot.lungeTimer = randBetween(0.5, 1.0);
+          robot.lungeDriveTime = robot.lungeTimer;
         }
+        
         if (robot.lungePhase === 'drive') {
-          const m = this.gotoPoint(robot, robot.lungeTarget, CFG.LUNGE_SPEED / CFG.MAX_LIN_SPEED);
-          robot.pwmLeft  = m.left;
-          robot.pwmRight = m.right;
-          if (m.arrived || robot.pos.distTo(robot.lungeTarget) < 0.07) {
+          robot.lungeTimer -= dt;
+          robot.pwmLeft = 1.0;
+          robot.pwmRight = 1.0;
+          if (robot.lungeTimer <= 0) {
             robot.lungePhase = 'back';
+            robot.lungeTimer = robot.lungeDriveTime;
           }
         } else if (robot.lungePhase === 'back') {
-          const m = this.gotoPoint(robot, robot.lungeOrigin, 0.8, true);
-          robot.pwmLeft  = m.left;
-          robot.pwmRight = m.right;
-          if (m.arrived || robot.pos.distTo(robot.lungeOrigin) < 0.08) {
+          robot.lungeTimer -= dt;
+          robot.pwmLeft = -0.8;
+          robot.pwmRight = -0.8;
+          if (robot.lungeTimer <= 0) {
             robot.lungePhase = 'done';
-            robot.lungeTarget = null;
           }
         }
         break;
 
       case STATE.RETREATING:
-        {
-          const clutch = robot.activeClutchIdx >= 0
-            ? robot.clutches[robot.activeClutchIdx].center
-            : new Vec2(0, 0);
-          const m = this.gotoPoint(robot, clutch, 0.7, true);
-          robot.pwmLeft  = m.left;
-          robot.pwmRight = m.right;
-          const dist = robot.pos.distTo(clutch);
-          if (m.arrived || dist < 0.25) {
-            this.enter(robot, STATE.GUARD);
-          }
-          if (robot.stateTimer > 15) this.enter(robot, STATE.GUARD);
+        // Back up for a fixed time to return to the clutch area
+        robot.pwmLeft = -0.6;
+        robot.pwmRight = -0.6;
+        if (robot.stateTimer > 2.0) {
+          this.enter(robot, STATE.GUARD);
         }
         break;
 
@@ -297,46 +229,15 @@ const RobotFirmware = {
           break;
         }
         if (robot.stateTimer >= CFG.GUARD_DURATION) {
-          if (legsPresent) {
-            this.enter(robot, STATE.AGGRESSION);
-          } else {
-            this.enter(robot, STATE.CALMING);
-          }
+          this.enter(robot, STATE.CALMING);
           break;
         }
-        {
-          const clutch = robot.activeClutchIdx >= 0
-            ? robot.clutches[robot.activeClutchIdx].center
-            : new Vec2(0, 0);
-
-          robot.jitterTimer += dt;
-          if (!robot.jitterTarget || robot.jitterTimer > 0.8) {
-            robot.jitterTimer = 0;
-            const a = Math.random() * 2 * Math.PI;
-            const r = randBetween(0.05, 0.22);
-            const jx = clutch.x + Math.cos(a) * r;
-            const jy = clutch.y + Math.sin(a) * r;
-            const jv = new Vec2(jx, jy);
-            if (jv.len() < CFG.ZONE_RADIUS - 0.2) robot.jitterTarget = jv;
-          }
-
-          const jTarget = robot.jitterTarget || clutch;
-          const distToJitter = robot.pos.distTo(jTarget);
-          if (distToJitter < 0.06) {
-            if (legsPresent) {
-              // no bearing info available; face forward
-              const f = this.faceTarget(robot, robot.pos.add(Vec2.fromAngle(robot.heading, 1)));
-              robot.pwmLeft  = f.left;
-              robot.pwmRight = f.right;
-            } else {
-              robot.pwmLeft  = 0;
-              robot.pwmRight = 0;
-            }
-          } else {
-            const m = this.gotoPoint(robot, jTarget, 0.55);
-            robot.pwmLeft  = m.left;
-            robot.pwmRight = m.right;
-          }
+        // Jitter in place
+        robot.jitterTimer -= dt;
+        if (robot.jitterTimer <= 0) {
+          robot.jitterTimer = randBetween(0.5, 1.5);
+          robot.pwmLeft = (Math.random() - 0.5) * 0.8;
+          robot.pwmRight = (Math.random() - 0.5) * 0.8;
         }
         break;
 
@@ -346,20 +247,9 @@ const RobotFirmware = {
           break;
         }
         robot.calmTimer += dt;
-        {
-          const clutch = robot.activeClutchIdx >= 0
-            ? robot.clutches[robot.activeClutchIdx].center
-            : new Vec2(0, 0);
-          const dist = robot.pos.distTo(clutch);
-          if (dist > 0.3) {
-            const m = this.gotoPoint(robot, clutch, 0.3);
-            robot.pwmLeft  = m.left;
-            robot.pwmRight = m.right;
-          } else {
-            robot.pwmLeft  = 0;
-            robot.pwmRight = 0;
-          }
-        }
+        robot.pwmLeft = 0;
+        robot.pwmRight = 0;
+        
         if (robot.calmTimer >= CFG.CALM_WAIT && !robot.didPostCalmLay) {
           robot.didPostCalmLay = true;
           this.layPostCalmClutch(robot);

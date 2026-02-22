@@ -119,6 +119,8 @@ class ColorSensor {
     const sensorPos = this._robot.pos.add(
       Vec2.fromAngle(this._robot.heading, CFG.COLOR_SENSOR_DIST)
     );
+    // Add some noise/unreliability to simulate real IR/color sensor
+    if (Math.random() < 0.05) return false;
     return sensorPos.len() >= zoneRadius - 0.02;
   }
 }
@@ -206,7 +208,7 @@ class Robot {
 
     // ── Boundary override (colour sensor) ──────────────
     if (this.state !== STATE.SLEEP) {
-      RobotFirmware.applyBoundaryRepulsion(this);
+      RobotFirmware.applyBoundaryRepulsion(this, dt);
     }
 
     // ── Integrate differential drive kinematics ─────────
