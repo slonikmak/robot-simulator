@@ -52,3 +52,6 @@
 Вид можно приближать/удалять. 
 
 Код поведения робота - близкий к тому что можно сделать на arduino, и максимально точная симуляция датчиков и моторов. Метание икры - это просто визуальный эффект, который можно реализовать с помощью анимации.
+## Requirements
+
+- **R-010**: The simulation environment shall be bounded by four walls forming a rectangular room of 20 by 10 meters, centered at (0,0).

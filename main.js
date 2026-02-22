@@ -13,10 +13,10 @@ const CFG = {
   ROBOT_RADIUS:  0.15,  // m  – robot body radius (30 cm ⌀)
   WHEEL_BASE:    0.28,  // m  – distance between driven wheels
 
-  // Obstacles
-  WALL_WIDTH:     3.0,   // m – bottom wall length (slightly wider than zone)
-  WALL_THICKNESS: 0.12,  // m – wall thickness
-  WALL_INTRUSION: 0.10,  // m – how much the wall enters the zone from the bottom
+  // World boundaries
+  ROOM_WIDTH:     20.0,  // m
+  ROOM_HEIGHT:    10.0,  // m
+  WALL_THICKNESS: 0.15,  // m
 
   // Legs (cursor) physical approximation (for ultrasonic ray hit)
   LEGS_RADIUS:    0.11,  // m – effective radius for ray intersection
@@ -177,11 +177,15 @@ class RectObstacle {
 }
 
 const OBSTACLES = (() => {
-  const yTop = CFG.ZONE_RADIUS - CFG.WALL_INTRUSION;
-  const cy   = yTop + CFG.WALL_THICKNESS * 0.5;
+  const W = CFG.ROOM_WIDTH;
+  const H = CFG.ROOM_HEIGHT;
+  const T = CFG.WALL_THICKNESS;
   return [
-    // Bottom wall: mostly outside the zone, slightly intrudes.
-    new RectObstacle(0, cy, CFG.WALL_WIDTH, CFG.WALL_THICKNESS),
+    // 20x10 Rectangular room centered at 0,0
+    new RectObstacle(0, -H * 0.5, W + T, T), // Top wall
+    new RectObstacle(0,  H * 0.5, W + T, T), // Bottom wall
+    new RectObstacle(-W * 0.5, 0, T, H + T), // Left wall
+    new RectObstacle( W * 0.5, 0, T, H + T), // Right wall
   ];
 })();
 
