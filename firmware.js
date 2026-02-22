@@ -21,7 +21,236 @@ const STATE_LABELS = {
   CALMING:    '😮‍💨 Успокаивается',
 };
 
+// ── Threat classification (no map, HC-SR04-like distance only) ─────────────
+// We assume the sensor returns only distance (or Infinity). We distinguish
+// legs vs static walls/obstacles using temporal signatures and a short
+// active-probing micro-rotation.
+const THREAT_CFG = {
+  SAMPLE_DT: 1 / CFG.ULTRASONIC_HZ,
+  RING_N: 8,
+
+  NEAR_DIST: CFG.WAKE_DIST_FROM_BOUNDARY,
+
+  PROBE_DUR: 0.85,
+  PROBE_TOGGLE: 0.18,
+  PROBE_PWM: 0.22,
+
+  COOLDOWN_DUR: 2.0,
+  WALL_AVOID_DUR: 0.9,
+
+  // Heuristics tuned for metres and ULTRASONIC_NOISE ~ 0.02.
+  MOVING_ABS_DERIV: 0.10,    // m/sample, when robot is not driving forward
+  PROBE_DROPOUT_RATE: 0.20,  // % of samples that became Infinity during probe
+  PROBE_SPREAD: 0.14,        // max-min during probe
+};
+
 const RobotFirmware = {
+
+  _ensureThreatState(robot) {
+    if (robot._threat) return;
+    robot._threat = {
+      sampleTimer: 0,
+      ring: new Array(THREAT_CFG.RING_N).fill(Infinity),
+      ringIdx: 0,
+      ringCount: 0,
+
+      phase: 'idle', // idle | probing | cooldown
+      cooldown: 0,
+      wallAvoid: 0,
+
+      probeTimer: 0,
+      probeToggleTimer: 0,
+      probeDir: 1,
+      probeSamples: 0,
+      probeInf: 0,
+      probeMin: Infinity,
+      probeMax: 0,
+      probeLastFinite: null,
+      probeAbsDerivSum: 0,
+    };
+  },
+
+  _pushThreatSample(threat, dist) {
+    threat.ring[threat.ringIdx] = dist;
+    threat.ringIdx = (threat.ringIdx + 1) % THREAT_CFG.RING_N;
+    threat.ringCount = Math.min(THREAT_CFG.RING_N, threat.ringCount + 1);
+  },
+
+  _ringStats(threat) {
+    const n = threat.ringCount;
+    if (n <= 0) return null;
+
+    let finiteN = 0;
+    let infN = 0;
+    let min = Infinity;
+    let max = 0;
+    let sum = 0;
+    let lastFinite = null;
+    let absDerivSum = 0;
+
+    for (let i = 0; i < n; i++) {
+      const v = threat.ring[i];
+      if (!Number.isFinite(v)) {
+        infN++;
+        continue;
+      }
+      finiteN++;
+      sum += v;
+      if (v < min) min = v;
+      if (v > max) max = v;
+      if (lastFinite != null) absDerivSum += Math.abs(v - lastFinite);
+      lastFinite = v;
+    }
+
+    const mean = finiteN ? (sum / finiteN) : Infinity;
+    const absDerivMean = (finiteN >= 2) ? (absDerivSum / (finiteN - 1)) : 0;
+    return {
+      n,
+      finiteN,
+      infN,
+      min,
+      max,
+      mean,
+      absDerivMean,
+      dropoutRate: n ? (infN / n) : 1,
+      spread: (finiteN ? (max - min) : 0),
+    };
+  },
+
+  _updateThreatClassifier(robot, dt) {
+    this._ensureThreatState(robot);
+    const threat = robot._threat;
+
+    // Timers
+    if (threat.cooldown > 0) threat.cooldown = Math.max(0, threat.cooldown - dt);
+    if (threat.wallAvoid > 0) threat.wallAvoid = Math.max(0, threat.wallAvoid - dt);
+
+    const dist = robot.ultrasonic.lastMeasurement;
+    const near = Number.isFinite(dist) && dist < THREAT_CFG.NEAR_DIST;
+
+    // Keep a sensor-rate ring buffer (so we don't overweight render-frame dt).
+    threat.sampleTimer += dt;
+    while (threat.sampleTimer >= THREAT_CFG.SAMPLE_DT) {
+      threat.sampleTimer -= THREAT_CFG.SAMPLE_DT;
+      this._pushThreatSample(threat, dist);
+    }
+
+    // If already in aggression, classifier is irrelevant.
+    if (robot.state === STATE.AGGRESSION) {
+      threat.phase = 'idle';
+      threat.probeTimer = 0;
+      threat.probeSamples = 0;
+      return { threat: true, override: false, enterAggression: false };
+    }
+
+    // Wall avoidance (post-classification) – short and bounded.
+    if (threat.wallAvoid > 0) {
+      // Only apply avoid in states where motion is OK.
+      if (robot.state === STATE.IDLE_SAFE || robot.state === STATE.GUARD || robot.state === STATE.CALMING) {
+        robot.pwmLeft  = -0.55;
+        robot.pwmRight = -0.25;
+        return { threat: false, override: true, enterAggression: false };
+      }
+    }
+
+    // Probing phase (micro-rotation) to differentiate a small target vs a flat/static surface.
+    if (threat.phase === 'probing') {
+      threat.probeTimer += dt;
+      threat.probeToggleTimer += dt;
+      if (threat.probeToggleTimer >= THREAT_CFG.PROBE_TOGGLE) {
+        threat.probeToggleTimer = 0;
+        threat.probeDir *= -1;
+      }
+
+      // Sample at sensor rate during probe.
+      // Note: dist is the latest measurement; sensor model updates independently.
+      // We'll treat Infinity as a dropout.
+      if (Number.isFinite(dist)) {
+        threat.probeSamples++;
+        if (dist < threat.probeMin) threat.probeMin = dist;
+        if (dist > threat.probeMax) threat.probeMax = dist;
+        if (threat.probeLastFinite != null) {
+          threat.probeAbsDerivSum += Math.abs(dist - threat.probeLastFinite);
+        }
+        threat.probeLastFinite = dist;
+      } else {
+        threat.probeSamples++;
+        threat.probeInf++;
+      }
+
+      // Override motion: rotate in place.
+      const p = THREAT_CFG.PROBE_PWM * threat.probeDir;
+      robot.pwmLeft  = -p;
+      robot.pwmRight =  p;
+
+      if (threat.probeTimer < THREAT_CFG.PROBE_DUR) {
+        return { threat: false, override: true, enterAggression: false };
+      }
+
+      // Decide
+      const n = Math.max(1, threat.probeSamples);
+      const dropoutRate = threat.probeInf / n;
+      const spread = (Number.isFinite(threat.probeMin) && Number.isFinite(threat.probeMax)) ? (threat.probeMax - threat.probeMin) : 0;
+
+      let legsScore = 0;
+      if (dropoutRate >= THREAT_CFG.PROBE_DROPOUT_RATE) legsScore++;
+      if (spread >= THREAT_CFG.PROBE_SPREAD) legsScore++;
+
+      // Reset probe state
+      threat.phase = 'idle';
+      threat.probeTimer = 0;
+      threat.probeToggleTimer = 0;
+      threat.probeDir = 1;
+      threat.probeSamples = 0;
+      threat.probeInf = 0;
+      threat.probeMin = Infinity;
+      threat.probeMax = 0;
+      threat.probeLastFinite = null;
+      threat.probeAbsDerivSum = 0;
+
+      if (legsScore >= 1) {
+        // “Moving legs” signature: intermittent + angle-sensitive.
+        return { threat: true, override: false, enterAggression: true };
+      }
+
+      // Classified as static surface (wall/obstacle) – apply cooldown & optional avoid.
+      threat.cooldown = THREAT_CFG.COOLDOWN_DUR;
+      threat.wallAvoid = THREAT_CFG.WALL_AVOID_DUR;
+      return { threat: false, override: true, enterAggression: false };
+    }
+
+    // Not probing.
+    if (!near) return { threat: false, override: false, enterAggression: false };
+    if (threat.cooldown > 0) return { threat: false, override: false, enterAggression: false };
+
+    // Fast-path: if the distance stream changes a lot while we are not driving forward,
+    // it's likely a moving target (legs) rather than a static wall.
+    const stats = this._ringStats(threat);
+    if (stats && stats.finiteN >= 3) {
+      const drive = (robot.pwmLeft + robot.pwmRight) * 0.5;
+      const drivingForward = drive > 0.35;
+      if (!drivingForward && stats.absDerivMean >= THREAT_CFG.MOVING_ABS_DERIV) {
+        return { threat: true, override: false, enterAggression: true };
+      }
+    }
+
+    // Otherwise start probe.
+    threat.phase = 'probing';
+    threat.probeTimer = 0;
+    threat.probeToggleTimer = 0;
+    threat.probeDir = 1;
+    threat.probeSamples = 0;
+    threat.probeInf = 0;
+    threat.probeMin = Infinity;
+    threat.probeMax = 0;
+    threat.probeLastFinite = null;
+    threat.probeAbsDerivSum = 0;
+    // Immediately override this tick.
+    const p = THREAT_CFG.PROBE_PWM;
+    robot.pwmLeft  = -p;
+    robot.pwmRight =  p;
+    return { threat: false, override: true, enterAggression: false };
+  },
 
   enter(robot, newState) {
     robot.state      = newState;
@@ -106,25 +335,24 @@ const RobotFirmware = {
   updateBehavior(robot, dt) {
     robot.stateTimer += dt;
 
-    const ultraDist = robot.ultrasonic.lastMeasurement;
-    const legsPresent = ultraDist < CFG.WAKE_DIST_FROM_BOUNDARY;
-
-    if (legsPresent && robot.state !== STATE.AGGRESSION) {
+    const threatDecision = this._updateThreatClassifier(robot, dt);
+    if (threatDecision.enterAggression && robot.state !== STATE.AGGRESSION) {
       this.enter(robot, STATE.AGGRESSION);
+    }
+    if (threatDecision.override && robot.state !== STATE.AGGRESSION) {
+      // Probing/avoidance takes control for this tick.
+      return;
     }
 
     switch (robot.state) {
       case STATE.SLEEP:
         robot.pwmLeft  = 0;
         robot.pwmRight = 0;
-        if (legsPresent) this.enter(robot, STATE.AGGRESSION);
+        // Threat classifier handles transition to AGGRESSION.
         break;
 
       case STATE.IDLE_SAFE:
-        if (legsPresent) {
-          this.enter(robot, STATE.AGGRESSION);
-          break;
-        }
+        // Threat classifier handles transition to AGGRESSION.
         robot.safeTimer += dt;
         if (robot.safeTimer >= CFG.SAFE_CYCLE_PERIOD) {
           robot.safeTimer = 0;
@@ -141,11 +369,7 @@ const RobotFirmware = {
         break;
 
       case STATE.LAYING:
-        if (legsPresent) {
-          robot.isBuzzing = false;
-          this.enter(robot, STATE.AGGRESSION);
-          break;
-        }
+        // Threat classifier handles transition to AGGRESSION.
         
         robot.pwmLeft  = 0;
         robot.pwmRight = 0;
@@ -180,7 +404,10 @@ const RobotFirmware = {
           this.enter(robot, STATE.RETREATING);
           break;
         }
-        if (!legsPresent) {
+        // If target is lost, rotate-search; classifier will re-trigger AGGRESSION if it re-acquires legs.
+        const ultraDist = robot.ultrasonic.lastMeasurement;
+        const legsVisibleNow = Number.isFinite(ultraDist) && ultraDist < THREAT_CFG.NEAR_DIST;
+        if (!legsVisibleNow) {
           // Search behavior (rotation) when target is lost
           robot.pwmLeft = -0.5;
           robot.pwmRight = 0.5;
