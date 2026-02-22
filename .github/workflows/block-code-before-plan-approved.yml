@@ -1,0 +1,66 @@
+name: Block code changes before plan approval
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, labeled, unlabeled, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if src/tests changed without plan:approved
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pull_number = pr.number;
+
+            // Config
+            const PLAN_APPROVED_LABEL = "plan:approved";
+            const CODE_PATH_PREFIXES = ["src/", "tests/"];
+
+            function hasLabel(labels, name) {
+              return (labels || []).some(l => (l.name || "").toLowerCase() === name.toLowerCase());
+            }
+
+            async function listChangedFiles() {
+              const files = [];
+              let page = 1;
+              while (true) {
+                const resp = await github.rest.pulls.listFiles({
+                  owner, repo, pull_number,
+                  per_page: 100,
+                  page
+                });
+                for (const f of resp.data) files.push(f.filename);
+                if (resp.data.length < 100) break;
+                page += 1;
+              }
+              return files;
+            }
+
+            function touchesCode(files) {
+              return files.some(fn => CODE_PATH_PREFIXES.some(p => fn.startsWith(p)));
+            }
+
+            const files = await listChangedFiles();
+            const codeTouched = touchesCode(files);
+            const planApproved = hasLabel(pr.labels, PLAN_APPROVED_LABEL);
+
+            if (codeTouched && !planApproved) {
+              const msg =
+                `This PR changes code/tests (${CODE_PATH_PREFIXES.join(", ")}), ` +
+                `but it is not plan-approved.\n\n` +
+                `Add label "${PLAN_APPROVED_LABEL}" to approve the plan first, ` +
+                `or revert code/test changes until the plan is approved.\n\n` +
+                `Tip: keep the first commit(s) plan-only (tasks/ + spec/adr if needed).`;
+              core.setFailed(msg);
+            } else {
+              core.info("OK: either no code/test changes, or plan is approved.");
+            }
