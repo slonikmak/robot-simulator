@@ -6,59 +6,6 @@
 
 'use strict';
 
-// ── Tuneable constants ────────────────────────────────────────
-const CFG = {
-  // World
-  ZONE_RADIUS:   2.0,   // m  – habitat zone radius (диаметр 4.0 м)
-  ROBOT_RADIUS:  0.15,  // m  – robot body radius (30 cm ⌀)
-  WHEEL_BASE:    0.28,  // m  – distance between driven wheels
-
-  // World boundaries
-  ROOM_WIDTH:     20.0,  // m
-  ROOM_HEIGHT:    10.0,  // m
-  WALL_THICKNESS: 0.15,  // m
-
-  // Legs (cursor) physical approximation (for ultrasonic ray hit)
-  LEGS_RADIUS:    0.11,  // m – effective radius for ray intersection
-
-  // Speeds (realistic Arduino/motor limits)
-  MAX_LIN_SPEED: 0.25,  // m/s  forward/backward
-  MAX_ANG_SPEED: 2.0,   // rad/s  rotation
-  LINEAR_ACCEL:  0.5,   // m/s² acceleration limit
-  LUNGE_SPEED:   0.35,  // m/s  aggression lunge speed
-
-  // Timings (seconds, real-time; TIME_SCALE multiplies sim clock)
-  AGGRESSION_DURATION:  30,
-  GUARD_DURATION:       30,
-  CALM_WAIT:            60,   // before extra clutch after legs leave
-  SAFE_CYCLE_PERIOD:    180,  // 3 minutes before laying in safety
-  INTER_CLUTCH_DELAY:   3.0,  // pause between clutches during laying
-
-  // Eggs
-  CLUTCH_COUNT:         3,    // clutches per safety cycle
-  EGGS_PER_CLUTCH:      10,
-  EGG_SPREAD:           0.07, // m – radius of egg scatter around drop point
-  CLUTCH_OFFSET:        0.05, // m – shift for "post-calming" clutch
-
-  // Sensor model
-  ULTRASONIC_RANGE:     3.0,  // m
-  ULTRASONIC_NOISE:     0.02, // m std-dev noise
-  ULTRASONIC_HZ:        15,   // update frequency
-  ULTRASONIC_FOV:       Math.PI * (15 / 180), // rad (15°) valid detection cone
-  COLOR_SENSOR_DIST:    0.06, // m – sensor is this far ahead of robot center
-
-  // Trigger distances (metres)
-  WAKE_DIST_FROM_BOUNDARY:  3.0,  // legs this close → robot wakes/activates
-  LUNGE_AMPLITUDE_MIN:      0.25,
-  LUNGE_AMPLITUDE_MAX:      0.50,
-
-  // Rendering
-  PX_PER_METER_DEFAULT: 130,  // pixels per metre at zoom=1
-  ZOOM_MIN:  0.3,
-  ZOOM_MAX:  4.0,
-  ZOOM_STEP: 0.001,
-};
-
 // ── Helpers ───────────────────────────────────────────────────
 function lerp(a, b, t) { return a + (b - a) * t; }
 function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
@@ -241,7 +188,7 @@ class Renderer {
   // ── Draw zone ─────────────────────────────────────────
   drawZone() {
     const ctx = this.ctx;
-    const c   = this.w2s(new Vec2(0, 0));
+    const c   = this.w2s(new Vec2(CFG.ZONE_CENTER_X, CFG.ZONE_CENTER_Y));
     const R   = this.mToPx(CFG.ZONE_RADIUS);
 
     // Floor fill (light concrete)
@@ -300,7 +247,8 @@ class Renderer {
     ctx.font      = `${Math.max(10, this.mToPx(0.11))}px 'Segoe UI',sans-serif`;
     ctx.fillStyle = '#e8c84a88';
     ctx.textAlign = 'center';
-    ctx.fillText('⌀ 4.0 м (зона обитания)', c.x, c.y - labelR);
+    const diameter = (CFG.ZONE_RADIUS * 2).toFixed(1);
+    ctx.fillText(`⌀ ${diameter} м (зона обитания)`, c.x, c.y - labelR);
   }
 
   // ── Draw obstacles ───────────────────────────────────
@@ -709,7 +657,7 @@ const renderer = new Renderer(canvas);
 renderer.resize();
 
 // initial robot near zone centre, slightly offset
-const robot = new Robot(0.15, -0.10);
+const robot = new Robot(CFG.ZONE_CENTER_X - 0.3, CFG.ZONE_CENTER_Y + 0.2);
 const legsPos = new Vec2(-999, -999); // off-screen initially
 
 let lastTime  = null;
