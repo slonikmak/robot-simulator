@@ -167,6 +167,20 @@ class Renderer {
   constructor(canvas) {
     this.canvas = canvas;
     this.ctx    = canvas.getContext('2d');
+
+    // cache gradients per zoom
+    this._cachedZoom = null;
+    this._bodyGrad   = null;
+    this._headGrad   = null;
+
+    // offscreen buffer for static elements (zone + walls)
+    this._staticCanvas = document.createElement('canvas');
+    this._staticZoom   = null;
+    this._staticSize   = { w: 0, h: 0 };
+
+    // scratch vectors to avoid frequent allocations
+    this._tmpV1 = new Vec2();
+    this._tmpV2 = new Vec2();
   }
 
   resize() {
@@ -185,8 +199,17 @@ class Renderer {
     return new Vec2(r.x, r.y);
   }
 
+  // version that writes into an existing Vec2 to avoid allocation
+  _w2sInto(v, out) {
+    const r = worldToScreen(v.x, v.y, this.canvas);
+    out.x = r.x;
+    out.y = r.y;
+    return out;
+  }
+
   // ── Draw zone ─────────────────────────────────────────
   drawZone() {
+    // this function now only paints to current ctx; called by _renderStatic
     const ctx = this.ctx;
     const c   = this.w2s(new Vec2(CFG.ZONE_CENTER_X, CFG.ZONE_CENTER_Y));
     const R   = this.mToPx(CFG.ZONE_RADIUS);
@@ -206,18 +229,16 @@ class Renderer {
     const tilePx = this.mToPx(tileM);
     const startX = c.x - R - tilePx;
     const startY = c.y - R - tilePx;
+    ctx.beginPath();
     for (let x = startX; x <= c.x + R + tilePx; x += tilePx) {
-      ctx.beginPath();
       ctx.moveTo(x, startY);
       ctx.lineTo(x, c.y + R + tilePx);
-      ctx.stroke();
     }
     for (let y = startY; y <= c.y + R + tilePx; y += tilePx) {
-      ctx.beginPath();
       ctx.moveTo(startX, y);
       ctx.lineTo(c.x + R + tilePx, y);
-      ctx.stroke();
     }
+    ctx.stroke();
     ctx.restore();
 
     // Boundary marking (thick coloured line on floor)
@@ -287,9 +308,10 @@ class Renderer {
     clutches.forEach((clutch, ci) => {
       const isActive = ci === activeIdx;
       clutch.eggs.forEach(egg => {
-        const sp = this.w2s(egg.pos);
+        const sp = this._tmpV1;
+        this._w2sInto(egg.pos, sp);
         const r  = this.mToPx(egg.radius);
-        this.ctx.save();
+        const prevAlpha = this.ctx.globalAlpha;
         this.ctx.globalAlpha = egg.alpha * 0.92;
         this.ctx.beginPath();
         this.ctx.ellipse(sp.x, sp.y, r * 1.3, r, 0, 0, 2 * Math.PI);
@@ -298,7 +320,7 @@ class Renderer {
         this.ctx.lineWidth   = 0.8;
         this.ctx.fill();
         this.ctx.stroke();
-        this.ctx.restore();
+        this.ctx.globalAlpha = prevAlpha;
       });
 
       // Active clutch: glow ring
@@ -319,10 +341,11 @@ class Renderer {
   // ── Draw flying egg particles ─────────────────────────
   drawParticles(particles) {
     particles.forEach(p => {
-      const sp = this.w2s(p.pos);
+      const sp = this._tmpV1;
+      this._w2sInto(p.pos, sp);
       const r  = this.mToPx(p.r);
       const alpha = (1 - p.t) * 0.9;
-      this.ctx.save();
+      const prevAlpha = this.ctx.globalAlpha;
       this.ctx.globalAlpha = alpha;
       this.ctx.beginPath();
       this.ctx.ellipse(sp.x, sp.y, r * 1.3, r, p.t * Math.PI, 0, 2 * Math.PI);
@@ -331,7 +354,7 @@ class Renderer {
       this.ctx.lineWidth   = 0.7;
       this.ctx.fill();
       this.ctx.stroke();
-      this.ctx.restore();
+      this.ctx.globalAlpha = prevAlpha;
     });
   }
 
@@ -339,7 +362,8 @@ class Renderer {
   drawRobot(robot) {
     const ctx  = this.ctx;
     const pos  = robot.pos.add(robot.vibrate);
-    const sp   = this.w2s(pos);
+    const sp   = this._tmpV1;
+    this._w2sInto(pos, sp);
     const R    = this.mToPx(CFG.ROBOT_RADIUS);
     const h    = robot.heading;
     const s    = this.scale;
@@ -360,11 +384,18 @@ class Renderer {
     // ── Body (red ellipse) ──
     ctx.beginPath();
     ctx.ellipse(0, 0, R, R * 0.9, 0, 0, 2 * Math.PI);
-    const bodyGrad = ctx.createRadialGradient(-R * 0.25, -R * 0.3, 0, 0, 0, R * 1.1);
-    bodyGrad.addColorStop(0, '#ff5a3a');
-    bodyGrad.addColorStop(0.6, '#cc2200');
-    bodyGrad.addColorStop(1,   '#801400');
-    ctx.fillStyle   = bodyGrad;
+    // cache gradients per zoom
+    if (this._cachedZoom !== camera.zoom) {
+      this._cachedZoom = camera.zoom;
+      this._bodyGrad = ctx.createRadialGradient(-R * 0.25, -R * 0.3, 0, 0, 0, R * 1.1);
+      this._bodyGrad.addColorStop(0, '#ff5a3a');
+      this._bodyGrad.addColorStop(0.6, '#cc2200');
+      this._bodyGrad.addColorStop(1,   '#801400');
+      this._headGrad = ctx.createRadialGradient(R * 0.72, -R * 0.1, 0, R * 0.82, 0, R * 0.32);
+      this._headGrad.addColorStop(0, '#444');
+      this._headGrad.addColorStop(1, '#111');
+    }
+    ctx.fillStyle   = this._bodyGrad;
     ctx.strokeStyle = '#601000';
     ctx.lineWidth   = Math.max(1, R * 0.07);
     ctx.fill();
@@ -393,10 +424,7 @@ class Renderer {
     // ── Head (dark circle, front = +x direction in local space) ──
     ctx.beginPath();
     ctx.arc(R * 0.82, 0, R * 0.32, 0, 2 * Math.PI);
-    const headGrad = ctx.createRadialGradient(R * 0.72, -R * 0.1, 0, R * 0.82, 0, R * 0.32);
-    headGrad.addColorStop(0, '#444');
-    headGrad.addColorStop(1, '#111');
-    ctx.fillStyle   = headGrad;
+    ctx.fillStyle   = this._headGrad;
     ctx.strokeStyle = '#000';
     ctx.lineWidth   = Math.max(0.5, R * 0.05);
     ctx.fill();
@@ -529,10 +557,14 @@ class Renderer {
 
   // ── Draw "legs" cursor ────────────────────────────────
   drawLegs(legsPos) {
-    const sp  = this.w2s(legsPos);
+    const sp  = this._tmpV1;
+    this._w2sInto(legsPos, sp);
     const ctx = this.ctx;
     const r   = this.mToPx(0.06);
-    const now = performance.now() / 1000;
+
+    // if legs are off-screen, skip detailed drawing
+    if (sp.x < -50 || sp.x > this.canvas.width + 50 ||
+        sp.y < -50 || sp.y > this.canvas.height + 50) return;
 
     // Two foot silhouettes
     const offsets = [
@@ -542,7 +574,7 @@ class Renderer {
     offsets.forEach(o => {
       ctx.save();
       ctx.translate(sp.x + o.dx, sp.y + o.dy);
-      ctx.rotate(o.rot + Math.sin(now * 5) * 0.06);
+      ctx.rotate(o.rot);
       ctx.beginPath();
       ctx.ellipse(0, 0, r * 0.55, r * 0.9, 0, 0, 2 * Math.PI);
       ctx.fillStyle = 'rgba(255,220,180,0.85)';
@@ -601,16 +633,39 @@ class Renderer {
   }
 
   // ── Main draw ─────────────────────────────────────────
+  _renderStatic(obstacles) {
+    const zc = this._staticCanvas;
+    const needsResize = zc.width !== this.canvas.width || zc.height !== this.canvas.height;
+    if (needsResize) {
+      zc.width  = this.canvas.width;
+      zc.height = this.canvas.height;
+      this._staticSize.w = zc.width;
+      this._staticSize.h = zc.height;
+    }
+    if (needsResize || this._staticZoom !== camera.zoom) {
+      const ctx = zc.getContext('2d');
+      ctx.clearRect(0, 0, zc.width, zc.height);
+      // paint background fill first so zone ring still overlays it
+      ctx.fillStyle = '#16162a';
+      ctx.fillRect(0, 0, zc.width, zc.height);
+
+      const prevCtx = this.ctx;
+      this.ctx = ctx; // temporarily direct drawZone/Obstacles here
+      this.drawZone();
+      this.drawObstacles(obstacles);
+      this.ctx = prevCtx;
+
+      this._staticZoom = camera.zoom;
+    }
+  }
+
   draw(robot, legsPos, obstacles) {
     const ctx = this.ctx;
-    ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
 
-    // Background
-    ctx.fillStyle = '#16162a';
-    ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+    // first composite static layer
+    this._renderStatic(obstacles);
+    ctx.drawImage(this._staticCanvas, 0, 0);
 
-    this.drawZone();
-    this.drawObstacles(obstacles);
     this.drawClutches(robot.clutches, robot.activeClutchIdx);
     this.drawParticles(robot.particles);
     this.drawRobot(robot);
@@ -622,6 +677,7 @@ class Renderer {
 // ── UI helpers ────────────────────────────────────────────────
 const elState   = document.getElementById('state-label');
 const elDist    = document.getElementById('dist-label');
+const elPercept = document.getElementById('percept-label');
 const elClutch  = document.getElementById('clutch-count-label');
 const elLayTmr  = document.getElementById('lay-timer-label');
 const elTimer   = document.getElementById('timer-label');
@@ -636,6 +692,12 @@ function updateUI(robot, timeScale) {
   // show ultrasonic sensor reading instead of legs distance
   const d = robot.ultrasonic.lastMeasurement;
   elDist.textContent = isFinite(d) ? `${d.toFixed(2)} м` : '> 3 м';
+
+  const PERCEPT_LABELS = { empty: '— пусто', scanning: '🔍 сканирует', legs: '🦵 ноги!', wall: '🧱 стена' };
+  const PERCEPT_COLORS = { empty: '#888', scanning: '#f0c040', legs: '#f05050', wall: '#60c0ff' };
+  const pk = robot.percept || 'empty';
+  elPercept.textContent = PERCEPT_LABELS[pk] || pk;
+  elPercept.style.color = PERCEPT_COLORS[pk] || '#888';
 
   const totalEggs = robot.clutches.reduce((a, c) => a + c.eggs.length, 0);
   elClutch.textContent = `${robot.clutches.length} кл. (${totalEggs} икринок)`;

@@ -21,7 +21,122 @@ const STATE_LABELS = {
   CALMING:    '😮‍💨 Успокаивается',
 };
 
+// ── Threat classification ─────────────────────────────────────────────────────
+// The robot mounts a fixed HC-SR04 (no servo). It cannot aim the sensor
+// independently. Instead, the firmware deliberately oscillates the whole body
+// (scan oscillation) and collects a ring-buffer of distance measurements over
+// one full oscillation sweep. A narrow object like a human leg causes a large
+// distance dispersion (beam sweeps past it → Infinity; hits it → close value).
+// A flat wall causes nearly constant distance across the whole sweep.
+//
+// Detection criteria (computed from the scan window):
+//   dropout_rate >= LEGS_DROPOUT  → beam "lost" the target at some angles  → leg-like
+//   OR spread   >= LEGS_SPREAD    → large distance variation within sweep  → leg-like
+const THREAT_CFG = {
+  NEAR_DIST:     CFG.WAKE_DIST_FROM_BOUNDARY,
+  COOLDOWN_DUR:  1.5,
+
+  // Ring buffer: collect samples across one full oscillation period
+  // At 15 Hz sensor rate, 1 oscillation ≈ 0.83 s → ~12-13 samples.
+  RING_N:        14,
+  SAMPLE_DT:     1 / CFG.ULTRASONIC_HZ,
+
+  // Leg signature thresholds
+  LEGS_DROPOUT:  0.30,   // fraction of samples that were Infinity
+  LEGS_SPREAD:   0.25,   // m, max-min of finite readings
+};
+
 const RobotFirmware = {
+
+  _ensureThreatState(robot) {
+    if (robot._threat) return;
+    robot._threat = {
+      cooldown:    0,
+      sampleTimer: 0,
+      ring:        new Array(THREAT_CFG.RING_N).fill(Infinity),
+      ringIdx:     0,
+      ringCount:   0,
+    };
+  },
+
+  _pushSample(threat, dist) {
+    threat.ring[threat.ringIdx] = dist;
+    threat.ringIdx = (threat.ringIdx + 1) % THREAT_CFG.RING_N;
+    threat.ringCount = Math.min(THREAT_CFG.RING_N, threat.ringCount + 1);
+  },
+
+  _scanStats(threat) {
+    const n = threat.ringCount;
+    if (n < 4) return null;   // not enough data yet
+    let finN = 0, infN = 0, minD = Infinity, maxD = 0;
+    for (let i = 0; i < n; i++) {
+      const idx = (threat.ringIdx - n + i + THREAT_CFG.RING_N) % THREAT_CFG.RING_N;
+      const v = threat.ring[idx];
+      if (Number.isFinite(v)) { finN++; if (v < minD) minD = v; if (v > maxD) maxD = v; }
+      else infN++;
+    }
+    return {
+      dropoutRate: infN / n,
+      spread: finN >= 2 ? (maxD - minD) : 0,
+    };
+  },
+
+  _updateThreatClassifier(robot, dt) {
+    this._ensureThreatState(robot);
+    const threat = robot._threat;
+
+    if (threat.cooldown > 0) threat.cooldown = Math.max(0, threat.cooldown - dt);
+
+    const dist = robot.ultrasonic.lastMeasurement;
+    const near = Number.isFinite(dist) && dist < THREAT_CFG.NEAR_DIST;
+
+    // Accumulate sensor readings at sensor rate into ring buffer
+    threat.sampleTimer += dt;
+    if (threat.sampleTimer >= THREAT_CFG.SAMPLE_DT) {
+      threat.sampleTimer -= THREAT_CFG.SAMPLE_DT;
+      // Only record samples when something is near; clear buffer when zone is empty
+      if (near) {
+        this._pushSample(threat, dist);
+      } else {
+        threat.ringCount = 0;
+        threat.ringIdx   = 0;
+      }
+    }
+
+    // Already in aggression?
+    if (robot.state === STATE.AGGRESSION) {
+      robot.percept = 'legs';
+      return { threat: true, enterAggression: false };
+    }
+
+    if (!near) {
+      robot.percept = 'empty';
+      return { threat: false, enterAggression: false };
+    }
+
+    if (threat.cooldown > 0) {
+      robot.percept = 'wall';
+      return { threat: false, enterAggression: false };
+    }
+
+    // Wait until we have a full sweep's worth of data before deciding
+    robot.percept = 'scanning';
+    const stats = this._scanStats(threat);
+    if (!stats) return { threat: false, enterAggression: false };
+
+    // Leg signature: narrow object → beam misses it often OR large spread
+    if (stats.dropoutRate >= THREAT_CFG.LEGS_DROPOUT || stats.spread >= THREAT_CFG.LEGS_SPREAD) {
+      robot.percept = 'legs';
+      threat.ringCount = 0;   // reset for next detection
+      return { threat: true, enterAggression: true };
+    }
+
+    // Wall signature: near but uniform readings → apply cooldown
+    robot.percept = 'wall';
+    threat.cooldown = THREAT_CFG.COOLDOWN_DUR;
+    threat.ringCount = 0;
+    return { threat: false, enterAggression: false };
+  },
 
   enter(robot, newState) {
     robot.state      = newState;
@@ -106,25 +221,23 @@ const RobotFirmware = {
   updateBehavior(robot, dt) {
     robot.stateTimer += dt;
 
-    const ultraDist = robot.ultrasonic.lastMeasurement;
-    const legsPresent = ultraDist < CFG.WAKE_DIST_FROM_BOUNDARY;
-
-    if (legsPresent && robot.state !== STATE.AGGRESSION) {
+    const threatDecision = this._updateThreatClassifier(robot, dt);
+    if (threatDecision.enterAggression && robot.state !== STATE.AGGRESSION) {
       this.enter(robot, STATE.AGGRESSION);
     }
+
+    const ultraDist   = robot.ultrasonic.lastMeasurement;
+    const legsPresent  = Number.isFinite(ultraDist) && ultraDist < THREAT_CFG.NEAR_DIST;
 
     switch (robot.state) {
       case STATE.SLEEP:
         robot.pwmLeft  = 0;
         robot.pwmRight = 0;
-        if (legsPresent) this.enter(robot, STATE.AGGRESSION);
+        // Threat classifier handles transition to AGGRESSION.
         break;
 
       case STATE.IDLE_SAFE:
-        if (legsPresent) {
-          this.enter(robot, STATE.AGGRESSION);
-          break;
-        }
+        // Threat classifier handles transition to AGGRESSION.
         robot.safeTimer += dt;
         if (robot.safeTimer >= CFG.SAFE_CYCLE_PERIOD) {
           robot.safeTimer = 0;
@@ -141,11 +254,7 @@ const RobotFirmware = {
         break;
 
       case STATE.LAYING:
-        if (legsPresent) {
-          robot.isBuzzing = false;
-          this.enter(robot, STATE.AGGRESSION);
-          break;
-        }
+        // Threat classifier handles transition to AGGRESSION.
         
         robot.pwmLeft  = 0;
         robot.pwmRight = 0;
@@ -180,6 +289,7 @@ const RobotFirmware = {
           this.enter(robot, STATE.RETREATING);
           break;
         }
+        // If target is lost, rotate-search; classifier will re-trigger AGGRESSION if it re-acquires legs.
         if (!legsPresent) {
           // Search behavior (rotation) when target is lost
           robot.pwmLeft = -0.5;
@@ -259,6 +369,28 @@ const RobotFirmware = {
           this.enter(robot, STATE.IDLE_SAFE);
         }
         break;
+    }
+
+    this._ensureConstantMotion(robot, dt);
+  },
+
+  _ensureConstantMotion(robot, dt) {
+    if (robot.state === STATE.SLEEP || robot.state === STATE.LAYING) return;
+
+    // Update head-scan oscillation phase
+    robot.scanOscPhase += robot.scanOscFreq * 2 * Math.PI * dt;
+    const scanBias = Math.sin(robot.scanOscPhase) * robot.scanOscAmplitude;
+
+    const deadzone = 0.08;
+    if (Math.abs(robot.pwmLeft) < deadzone && Math.abs(robot.pwmRight) < deadzone) {
+      const baseForward = 0.28;
+      const turn = (Math.random() - 0.5) * 0.16;
+      robot.pwmLeft  = baseForward + turn - scanBias;
+      robot.pwmRight = baseForward - turn + scanBias;
+    } else {
+      // Add scan oscillation to existing motion
+      robot.pwmLeft  -= scanBias * 0.5;
+      robot.pwmRight += scanBias * 0.5;
     }
   },
 };
