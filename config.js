@@ -47,6 +47,17 @@ const CFG = {
   ULTRASONIC_FOV:       Math.PI * (15 / 180), // rad (15°) valid detection cone
   COLOR_SENSOR_DIST:    0.06, // m – sensor is this far ahead of robot center
 
+  // Ultrasonic (realistic bounds + timing)
+  ULTRASONIC_MIN_CM:        8,
+  ULTRASONIC_MAX_CM:        250,
+  ULTRASONIC_NO_ECHO_CM:    300,
+  ULTRASONIC_PING_MIN_DT:   0.025, // s – minimum time between pings
+
+  // Servo (ultrasonic mount)
+  SERVO_LIMIT_DEG:          60,    // mechanical limit (matches scan sector)
+  SERVO_MAX_SPEED_DPS:      600,   // deg/s
+  SERVO_SETTLE_S:           0.04,  // s – wait after motion before trusting pings
+
   // Trigger distances (metres)
   WAKE_DIST_FROM_BOUNDARY:  1.5,  // legs this close → robot wakes/activates
   LUNGE_AMPLITUDE_MIN:      0.50,

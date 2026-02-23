@@ -1,396 +1,669 @@
 'use strict';
 
-// ── State machine states (Arduino-style firmware) ─────────────
+// ── New behaviour: territory + shove (servo ultrasonic + line) ─────────────
 const STATE = {
-  SLEEP:       'SLEEP',
-  IDLE_SAFE:   'IDLE_SAFE',
-  LAYING:      'LAYING',
-  AGGRESSION:  'AGGRESSION',
-  RETREATING:  'RETREATING',
-  GUARD:       'GUARD',
-  CALMING:     'CALMING',
+  PATROL:      'PATROL',
+  ACQUIRE:     'ACQUIRE',
+  SHOVE:       'SHOVE',
+  BLOCK:       'BLOCK',
+  LINE_AVOID:  'LINE_AVOID',
+  PANIC:       'PANIC',
+  RECOVER:     'RECOVER',
 };
 
 const STATE_LABELS = {
-  SLEEP:      '😴 Сон',
-  IDLE_SAFE:  '✅ Спокойно',
-  LAYING:     '🥚 Откладывает икру',
-  AGGRESSION: '⚔️ Агрессия',
-  RETREATING: '🔙 Отступает к кладке',
-  GUARD:      '🛡 Охраняет кладку',
-  CALMING:    '😮‍💨 Успокаивается',
+  PATROL:     '🧭 Патруль',
+  ACQUIRE:    '🎯 Наведение',
+  SHOVE:      '⚠️ Отгон',
+  BLOCK:      '⛔ Блокирует',
+  LINE_AVOID: '🟨 Граница',
+  PANIC:      '🛑 Аварийно',
+  RECOVER:    '😮‍💨 Отпускает',
 };
 
-// ── Threat classification ─────────────────────────────────────────────────────
-// The robot mounts a fixed HC-SR04 (no servo). It cannot aim the sensor
-// independently. Instead, the firmware deliberately oscillates the whole body
-// (scan oscillation) and collects a ring-buffer of distance measurements over
-// one full oscillation sweep. A narrow object like a human leg causes a large
-// distance dispersion (beam sweeps past it → Infinity; hits it → close value).
-// A flat wall causes nearly constant distance across the whole sweep.
-//
-// Detection criteria (computed from the scan window):
-//   dropout_rate >= LEGS_DROPOUT  → beam "lost" the target at some angles  → leg-like
-//   OR spread   >= LEGS_SPREAD    → large distance variation within sweep  → leg-like
-const THREAT_CFG = {
-  NEAR_DIST:     CFG.WAKE_DIST_FROM_BOUNDARY,
-  COOLDOWN_DUR:  1.5,
+function clampLocal(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
 
-  // Ring buffer: collect samples across one full oscillation period
-  // At 15 Hz sensor rate, 1 oscillation ≈ 0.83 s → ~12-13 samples.
-  RING_N:        14,
-  SAMPLE_DT:     1 / CFG.ULTRASONIC_HZ,
+function median3(a, b, c) {
+  if (a > b) { const t = a; a = b; b = t; }
+  if (b > c) { const t = b; b = c; c = t; }
+  if (a > b) { const t = a; a = b; b = t; }
+  return b;
+}
 
-  // Leg signature thresholds
-  LEGS_DROPOUT:  0.30,   // fraction of samples that were Infinity
-  LEGS_SPREAD:   0.25,   // m, max-min of finite readings
+function normaliseCmFromMeters(m) {
+  if (!Number.isFinite(m)) return CFG.ULTRASONIC_NO_ECHO_CM;
+  const cm = m * 100;
+  const c = clampLocal(cm, CFG.ULTRASONIC_MIN_CM, CFG.ULTRASONIC_MAX_CM);
+  return c;
+}
+
+function mean2(a, b) { return (a + b) * 0.5; }
+
+const BEHAV = {
+  // Distances (cm)
+  D_DETECT: 100,
+  D_ENGAGE: 80,
+  D_HOLD:   65,
+  D_SAFE:   50,
+  D_PANIC:  35,
+
+  // Patrol motion
+  V_PATROL:     0.35,
+  V_APPROACH:   0.45,
+  V_PUSH:       0.55,
+  V_PULL:       0.40,
+  V_PANIC_REV:  0.60,
+
+  // Turning
+  K_THETA:      0.015,
+  TURN_LIM:     0.35,
+
+  // Scan / ping
+  FRONT_PING_DT: 0.13,
+  FULL_SCAN_DT:  1.2,
+  PING_GAP_DT:   0.025,
+
+  // Wall vs target heuristics
+  FLAT_N:    4,
+  FLAT_T_CM: 15,
 };
+
+function scanAnglesDeg() {
+  const a = [];
+  for (let d = -60; d <= 60; d += 10) a.push(d);
+  return a;
+}
+
+function countTrue(arr) {
+  let n = 0;
+  for (let i = 0; i < arr.length; i++) if (arr[i]) n++;
+  return n;
+}
 
 const RobotFirmware = {
 
-  _ensureThreatState(robot) {
-    if (robot._threat) return;
-    robot._threat = {
-      cooldown:    0,
-      sampleTimer: 0,
-      ring:        new Array(THREAT_CFG.RING_N).fill(Infinity),
-      ringIdx:     0,
-      ringCount:   0,
+  _ensureRuntime(robot) {
+    if (robot._fw) return;
+    robot._fw = {
+      // scanning
+      scan: {
+        angles: scanAnglesDeg(),
+        mode: 'idle', // 'idle'|'full'
+        idx: 0,
+        stage: 'move', // move|ping1|gap|ping2
+        pingGap: 0,
+        pings: [],
+        raw: [],
+        filtered: null,
+        lastFullAt: -999,
+        requestedFull: true,
+
+        // front / target tracking
+        lastFrontAt: -999,
+        lastFrontSeq: -1,
+        frontCm: CFG.ULTRASONIC_NO_ECHO_CM,
+        frontHist: [false, false, false, false, false],
+        frontHistIdx: 0,
+
+        targetCm: CFG.ULTRASONIC_NO_ECHO_CM,
+        targetThetaDeg: 0,
+        targetIsWall: false,
+        fullHist: [false, false, false],
+        fullHistIdx: 0,
+      },
+
+      // stateful behaviour
+      returnState: STATE.PATROL,
+      patrolWiggleT: 0,
+      patrolWiggleRem: 0,
+      patrolWiggleDir: 1,
+
+      shove: {
+        phase: 'PUSH',
+        phaseT: 0,
+        cyclesDone: 0,
+        cyclesTarget: 4,
+        farT: 0,
+        closePersistT: 0,
+        snapStep: 0,
+      },
+
+      block: {
+        fakeLungeT: 0,
+        farT: 0,
+        lungeRem: 0,
+      },
+
+      panic: {
+        phase: 'STOP',
+        t: 0,
+        cooldown: 0,
+      },
     };
-  },
-
-  _pushSample(threat, dist) {
-    threat.ring[threat.ringIdx] = dist;
-    threat.ringIdx = (threat.ringIdx + 1) % THREAT_CFG.RING_N;
-    threat.ringCount = Math.min(THREAT_CFG.RING_N, threat.ringCount + 1);
-  },
-
-  _scanStats(threat) {
-    const n = threat.ringCount;
-    if (n < 4) return null;   // not enough data yet
-    let finN = 0, infN = 0, minD = Infinity, maxD = 0;
-    for (let i = 0; i < n; i++) {
-      const idx = (threat.ringIdx - n + i + THREAT_CFG.RING_N) % THREAT_CFG.RING_N;
-      const v = threat.ring[idx];
-      if (Number.isFinite(v)) { finN++; if (v < minD) minD = v; if (v > maxD) maxD = v; }
-      else infN++;
-    }
-    return {
-      dropoutRate: infN / n,
-      spread: finN >= 2 ? (maxD - minD) : 0,
-    };
-  },
-
-  _updateThreatClassifier(robot, dt) {
-    this._ensureThreatState(robot);
-    const threat = robot._threat;
-
-    if (threat.cooldown > 0) threat.cooldown = Math.max(0, threat.cooldown - dt);
-
-    const dist = robot.ultrasonic.lastMeasurement;
-    const near = Number.isFinite(dist) && dist < THREAT_CFG.NEAR_DIST;
-
-    // Accumulate sensor readings at sensor rate into ring buffer
-    threat.sampleTimer += dt;
-    if (threat.sampleTimer >= THREAT_CFG.SAMPLE_DT) {
-      threat.sampleTimer -= THREAT_CFG.SAMPLE_DT;
-      // Only record samples when something is near; clear buffer when zone is empty
-      if (near) {
-        this._pushSample(threat, dist);
-      } else {
-        threat.ringCount = 0;
-        threat.ringIdx   = 0;
-      }
-    }
-
-    // Already in aggression?
-    if (robot.state === STATE.AGGRESSION) {
-      robot.percept = 'legs';
-      return { threat: true, enterAggression: false };
-    }
-
-    if (!near) {
-      robot.percept = 'empty';
-      return { threat: false, enterAggression: false };
-    }
-
-    if (threat.cooldown > 0) {
-      robot.percept = 'wall';
-      return { threat: false, enterAggression: false };
-    }
-
-    // Wait until we have a full sweep's worth of data before deciding
-    robot.percept = 'scanning';
-    const stats = this._scanStats(threat);
-    if (!stats) return { threat: false, enterAggression: false };
-
-    // Leg signature: narrow object → beam misses it often OR large spread
-    if (stats.dropoutRate >= THREAT_CFG.LEGS_DROPOUT || stats.spread >= THREAT_CFG.LEGS_SPREAD) {
-      robot.percept = 'legs';
-      threat.ringCount = 0;   // reset for next detection
-      return { threat: true, enterAggression: true };
-    }
-
-    // Wall signature: near but uniform readings → apply cooldown
-    robot.percept = 'wall';
-    threat.cooldown = THREAT_CFG.COOLDOWN_DUR;
-    threat.ringCount = 0;
-    return { threat: false, enterAggression: false };
   },
 
   enter(robot, newState) {
-    robot.state      = newState;
+    this._ensureRuntime(robot);
+    robot.state = newState;
     robot.stateTimer = 0;
 
-    if (newState === STATE.AGGRESSION) {
-      robot.lungePhase   = null;
-      robot.lungeTimer   = 0;
-      robot.lungeDriveTime = 0;
+    const fw = robot._fw;
+    if (newState === STATE.PATROL) {
+      fw.scan.requestedFull = true;
     }
-    if (newState === STATE.GUARD) {
-      robot.jitterTimer  = 0;
+    if (newState === STATE.ACQUIRE) {
+      fw.scan.requestedFull = true;
     }
-    if (newState === STATE.LAYING) {
-      robot.layingStep      = 0;
-      robot.layingSubTimer  = 0;
-      robot.layingEggTimer  = 0;
-      robot.layingEggsLeft  = CFG.EGGS_PER_CLUTCH;
-      robot.isBuzzing       = true;
-      this.startNextClutch(robot);
+    if (newState === STATE.SHOVE) {
+      fw.shove.phase = 'PUSH';
+      fw.shove.phaseT = 0;
+      fw.shove.cyclesDone = 0;
+      fw.shove.cyclesTarget = 3 + (Math.random() * 4) | 0; // 3..6
+      fw.shove.farT = 0;
+      fw.shove.closePersistT = 0;
+      fw.shove.snapStep = 0;
+      fw.scan.requestedFull = true; // on entry, get a fresh theta
     }
-    if (newState === STATE.CALMING) {
-      robot.calmTimer       = 0;
-      robot.didPostCalmLay  = false;
+    if (newState === STATE.BLOCK) {
+      fw.block.fakeLungeT = 1.0;
+      fw.block.farT = 0;
+      fw.block.lungeRem = 0;
     }
-    if (newState === STATE.IDLE_SAFE) {
-      robot.isBuzzing = false;
+    if (newState === STATE.LINE_AVOID) {
+      // keep fw.returnState from caller
     }
-    if (newState === STATE.SLEEP) {
-      robot.isBuzzing = false;
-      robot.pwmLeft   = 0;
-      robot.pwmRight  = 0;
+    if (newState === STATE.PANIC) {
+      fw.panic.phase = 'STOP';
+      fw.panic.t = 0;
+      fw.panic.cooldown = 0;
+    }
+    if (newState === STATE.RECOVER) {
+      if (robot.servo) robot.servo.setTargetDeg(0);
     }
   },
 
-  startNextClutch(robot) {
-    // Lay clutch at current position (relative logic)
-    robot.currentLayingClutch = new Clutch(robot.pos.x, robot.pos.y);
-    robot.clutches.push(robot.currentLayingClutch);
-    robot.activeClutchIdx = robot.clutches.length - 1;
-    robot.layingEggsLeft  = CFG.EGGS_PER_CLUTCH;
-    robot.layingEggTimer  = 0;
-
-    this.spawnEggParticles(robot, robot.currentLayingClutch.center, 4);
+  _startFullScan(robot) {
+    const scan = robot._fw.scan;
+    scan.mode = 'full';
+    scan.idx = 0;
+    scan.stage = 'move';
+    scan.pingGap = 0;
+    scan.pings = [];
+    scan.raw = new Array(scan.angles.length).fill(CFG.ULTRASONIC_NO_ECHO_CM);
+    scan.filtered = null;
+    scan.lastFullAt = 0;
   },
 
-  spawnEggParticles(robot, target, n) {
+  _applyAngleMedianFilter(raw) {
+    const n = raw.length;
+    const out = new Array(n);
     for (let i = 0; i < n; i++) {
-      const offset = Vec2.fromAngle(Math.random() * 2 * Math.PI, CFG.ROBOT_RADIUS * 1.1);
-      robot.particles.push(new EggParticle(robot.pos.add(offset), target));
+      const a = raw[Math.max(0, i - 1)];
+      const b = raw[i];
+      const c = raw[Math.min(n - 1, i + 1)];
+      out[i] = median3(a, b, c);
+    }
+    return out;
+  },
+
+  _isFlatSegment(filtered, startIdx, len) {
+    let minD = Infinity, maxD = -Infinity, sum = 0;
+    for (let i = 0; i < len; i++) {
+      const v = filtered[startIdx + i];
+      minD = Math.min(minD, v);
+      maxD = Math.max(maxD, v);
+      sum += v;
+    }
+    const mean = sum / len;
+    return (maxD - minD) < BEHAV.FLAT_T_CM && mean < 200;
+  },
+
+  _classifyTargetFromScan(robot) {
+    const scan = robot._fw.scan;
+    const angles = scan.angles;
+    const d = scan.filtered;
+    if (!d) return;
+
+    // Find minimum in [-40..+40]
+    let bestIdx = -1;
+    let bestD = Infinity;
+    for (let i = 0; i < angles.length; i++) {
+      const a = angles[i];
+      if (a < -40 || a > 40) continue;
+      if (d[i] < bestD) { bestD = d[i]; bestIdx = i; }
+    }
+
+    scan.targetCm = bestIdx >= 0 ? bestD : CFG.ULTRASONIC_NO_ECHO_CM;
+    scan.targetThetaDeg = bestIdx >= 0 ? angles[bestIdx] : 0;
+
+    // Determine if around the best index we have a flat segment (wall-like)
+    let isWall = false;
+    if (bestIdx >= 0) {
+      const N = BEHAV.FLAT_N;
+      const startMin = Math.max(0, bestIdx - (N - 1));
+      const startMax = Math.min(d.length - N, bestIdx);
+      for (let s = startMin; s <= startMax; s++) {
+        if (this._isFlatSegment(d, s, N) && bestIdx >= s && bestIdx < s + N) {
+          isWall = true;
+          break;
+        }
+      }
+    }
+    scan.targetIsWall = isWall;
+
+    const present = (scan.targetCm < BEHAV.D_DETECT) && !isWall;
+    scan.fullHist[scan.fullHistIdx] = present;
+    scan.fullHistIdx = (scan.fullHistIdx + 1) % scan.fullHist.length;
+
+    // percept (debug)
+    if (scan.targetCm >= BEHAV.D_DETECT) robot.percept = 'empty';
+    else robot.percept = isWall ? 'wall' : 'legs';
+  },
+
+  _updateFullScan(robot, dt) {
+    const scan = robot._fw.scan;
+    if (scan.mode !== 'full') return;
+
+    const angles = scan.angles;
+    const i = scan.idx;
+
+    if (i >= angles.length) {
+      scan.mode = 'idle';
+      scan.filtered = this._applyAngleMedianFilter(scan.raw);
+      scan.lastFullAt = 0;
+      this._classifyTargetFromScan(robot);
+      return;
+    }
+
+    const thetaDeg = angles[i];
+    if (robot.servo) robot.servo.setTargetDeg(thetaDeg);
+
+    // Servo settle is handled by UltrasonicSensor.ping() (it refuses too early)
+    if (scan.stage === 'move') {
+      scan.pings.length = 0;
+      scan.stage = 'ping1';
+    }
+
+    if (scan.stage === 'ping1') {
+      const before = robot.ultrasonic.seq;
+      robot.ultrasonic.ping();
+      if (robot.ultrasonic.seq !== before) {
+        scan.pings.push(normaliseCmFromMeters(robot.ultrasonic.lastMeasurement));
+        scan.pingGap = 0;
+        scan.stage = 'gap';
+      }
+    } else if (scan.stage === 'gap') {
+      scan.pingGap += dt;
+      if (scan.pingGap >= BEHAV.PING_GAP_DT) {
+        scan.stage = 'ping2';
+      }
+    } else if (scan.stage === 'ping2') {
+      const before = robot.ultrasonic.seq;
+      robot.ultrasonic.ping();
+      if (robot.ultrasonic.seq !== before) {
+        scan.pings.push(normaliseCmFromMeters(robot.ultrasonic.lastMeasurement));
+        const a = scan.pings[0] ?? CFG.ULTRASONIC_NO_ECHO_CM;
+        const b = scan.pings[1] ?? a;
+        scan.raw[i] = mean2(a, b);
+        scan.idx++;
+        scan.stage = 'move';
+      }
     }
   },
 
-  layPostCalmClutch(robot) {
-    if (robot.activeClutchIdx < 0) return;
+  _updateFrontPing(robot, dt, servoDeg) {
+    const scan = robot._fw.scan;
+    if (scan.mode === 'full') {
+      robot.percept = 'scanning';
+      return;
+    }
 
-    // Lay clutch at current position
-    const clutch = new Clutch(robot.pos.x, robot.pos.y);
-    for (let i = 0; i < CFG.EGGS_PER_CLUTCH; i++) clutch.addEgg();
-    robot.clutches.push(clutch);
-    robot.activeClutchIdx = robot.clutches.length - 1;
+    if (robot.servo) robot.servo.setTargetDeg(servoDeg);
 
-    this.spawnEggParticles(robot, clutch.center, 6);
+    if (scan.lastFrontAt < BEHAV.FRONT_PING_DT) return;
+    scan.lastFrontAt = 0;
+
+    const before = robot.ultrasonic.seq;
+    robot.ultrasonic.ping();
+    if (robot.ultrasonic.seq === before) return;
+
+    const cm = normaliseCmFromMeters(robot.ultrasonic.lastMeasurement);
+    scan.frontCm = cm;
+    const present = cm < BEHAV.D_DETECT;
+    scan.frontHist[scan.frontHistIdx] = present;
+    scan.frontHistIdx = (scan.frontHistIdx + 1) % scan.frontHist.length;
   },
 
-  applyBoundaryRepulsion(robot, dt) {
-    if (robot.boundaryAvoidTimer > 0) {
-      robot.boundaryAvoidTimer -= dt;
-      robot.pwmLeft  = -0.6;
-      robot.pwmRight = -0.2;
-      return true;
-    }
-    if (robot.colorSensor.read(CFG.ZONE_RADIUS)) {
-      robot.boundaryAvoidTimer = 1.5;
-      robot.pwmLeft  = -0.6;
-      robot.pwmRight = -0.2;
-      return true;
-    }
-    return false;
+  _turnFromTheta(thetaDeg) {
+    const turn = clampLocal(BEHAV.K_THETA * thetaDeg, -BEHAV.TURN_LIM, BEHAV.TURN_LIM);
+    return turn;
+  },
+
+  _drive(robot, forward, turn) {
+    robot.pwmLeft  = clampLocal(forward - turn, -1, 1);
+    robot.pwmRight = clampLocal(forward + turn, -1, 1);
+  },
+
+  _lineDetected(robot) {
+    return robot.colorSensor && robot.colorSensor.read(CFG.ZONE_RADIUS);
   },
 
   updateBehavior(robot, dt) {
+    this._ensureRuntime(robot);
     robot.stateTimer += dt;
+    const fw = robot._fw;
+    const scan = fw.scan;
 
-    const threatDecision = this._updateThreatClassifier(robot, dt);
-    if (threatDecision.enterAggression && robot.state !== STATE.AGGRESSION) {
-      this.enter(robot, STATE.AGGRESSION);
+    // Start / run scans
+    if (scan.requestedFull && scan.mode !== 'full') {
+      this._startFullScan(robot);
+      scan.requestedFull = false;
+    }
+    if (scan.mode === 'full') {
+      robot.percept = 'scanning';
+      this._updateFullScan(robot, dt);
     }
 
-    const ultraDist   = robot.ultrasonic.lastMeasurement;
-    const legsPresent  = Number.isFinite(ultraDist) && ultraDist < THREAT_CFG.NEAR_DIST;
+    // Update timers while not in a full scan
+    if (scan.mode !== 'full') {
+      scan.lastFullAt += dt;
+      scan.lastFrontAt += dt;
+    }
+
+    // Line avoidance is absolute priority
+    if (robot.state !== STATE.LINE_AVOID && this._lineDetected(robot)) {
+      fw.returnState = robot.state;
+      this.enter(robot, STATE.LINE_AVOID);
+    }
+
+    // Convenience values (from last scan/track)
+    const targetCm = scan.targetCm;
+    const thetaDeg = scan.targetThetaDeg;
+    const confirmedByFull = countTrue(scan.fullHist) >= 2;
+    const confirmedByFront = countTrue(scan.frontHist) >= 3;
+    const hasTarget = (targetCm < BEHAV.D_DETECT) && !scan.targetIsWall;
 
     switch (robot.state) {
-      case STATE.SLEEP:
-        robot.pwmLeft  = 0;
-        robot.pwmRight = 0;
-        // Threat classifier handles transition to AGGRESSION.
+      case STATE.PATROL: {
+        // Scheduled full scan
+        if (scan.lastFullAt >= BEHAV.FULL_SCAN_DT) {
+          scan.requestedFull = true;
+        }
+
+        // Fast front check between full scans
+        this._updateFrontPing(robot, dt, 0);
+        if (scan.frontCm < BEHAV.D_DETECT) {
+          this.enter(robot, STATE.ACQUIRE);
+          break;
+        }
+
+        // Choose direction of free corridor based on last filtered scan
+        let desiredTheta = 0;
+        if (scan.filtered) {
+          let bestScore = -Infinity;
+          for (let i = 0; i < scan.angles.length; i++) {
+            const a = scan.angles[i];
+            if (a < -40 || a > 40) continue;
+            const dist = scan.filtered[i];
+            const score = dist - 0.8 * Math.abs(a);
+            if (score > bestScore) { bestScore = score; desiredTheta = a; }
+          }
+        }
+
+        // Occasional wiggle
+        if (fw.patrolWiggleT <= 0) {
+          fw.patrolWiggleT = 3 + Math.random() * 4;
+          fw.patrolWiggleDir = Math.random() < 0.5 ? -1 : 1;
+          if (scan.frontCm > 80) fw.patrolWiggleRem = 0.5;
+        } else {
+          fw.patrolWiggleT -= dt;
+        }
+
+        let wiggleBias = 0;
+        if (fw.patrolWiggleRem > 0) {
+          fw.patrolWiggleRem -= dt;
+          wiggleBias = fw.patrolWiggleDir * 10;
+        }
+
+        const turn = this._turnFromTheta(desiredTheta + wiggleBias);
+        this._drive(robot, BEHAV.V_PATROL, turn);
         break;
+      }
 
-      case STATE.IDLE_SAFE:
-        // Threat classifier handles transition to AGGRESSION.
-        robot.safeTimer += dt;
-        if (robot.safeTimer >= CFG.SAFE_CYCLE_PERIOD) {
-          robot.safeTimer = 0;
-          robot.clutchesThisCycle = 0;
-          this.enter(robot, STATE.LAYING);
+      case STATE.ACQUIRE: {
+        // Keep quick pings while we rotate to face the target.
+        this._updateFrontPing(robot, dt, thetaDeg);
+
+        // On acquire, insist on full scan(s) for classification.
+        if (scan.lastFullAt >= 0.9 && scan.mode !== 'full') {
+          scan.requestedFull = true;
         }
-        // Wander slowly
-        robot.pwmLeft  = 0.3;
-        robot.pwmRight = 0.3;
-        if (Math.random() < 0.02) {
-          robot.pwmLeft += (Math.random() - 0.5) * 0.4;
-          robot.pwmRight += (Math.random() - 0.5) * 0.4;
+
+        // Face the target (no forward motion)
+        const turn = this._turnFromTheta(thetaDeg);
+        this._drive(robot, 0, turn);
+        if (robot.servo) robot.servo.setTargetDeg(thetaDeg);
+
+        if ((hasTarget && (confirmedByFull || confirmedByFront)) || (targetCm < BEHAV.D_ENGAGE && !scan.targetIsWall)) {
+          this.enter(robot, STATE.SHOVE);
+          break;
+        }
+
+        if (robot.stateTimer > 1.5 && !(confirmedByFront || hasTarget)) {
+          this.enter(robot, STATE.PATROL);
         }
         break;
+      }
 
-      case STATE.LAYING:
-        // Threat classifier handles transition to AGGRESSION.
-        
-        robot.pwmLeft  = 0;
-        robot.pwmRight = 0;
-
-        robot.layingEggTimer += dt;
-        if (robot.layingEggsLeft > 0 && robot.layingEggTimer >= 0.18) {
-          robot.layingEggTimer -= 0.18;
-          robot.currentLayingClutch.addEgg();
-          robot.layingEggsLeft--;
-          const offset = Vec2.fromAngle(Math.random() * 2 * Math.PI, CFG.ROBOT_RADIUS * 0.9);
-          robot.particles.push(new EggParticle(robot.pos.add(offset), robot.currentLayingClutch.center));
+      case STATE.SHOVE: {
+        // Keep doing quick target pings at the last known target angle
+        this._updateFrontPing(robot, dt, thetaDeg);
+        const dNow = Math.min(targetCm, scan.frontCm);
+        if (dNow < BEHAV.D_PANIC) {
+          this.enter(robot, STATE.PANIC);
+          break;
         }
 
-        if (robot.layingEggsLeft <= 0) {
-          robot.layingSubTimer += dt;
-          if (robot.layingSubTimer >= CFG.INTER_CLUTCH_DELAY) {
-            robot.layingSubTimer = 0;
-            robot.layingStep++;
-            if (robot.layingStep < CFG.CLUTCH_COUNT) {
-              robot.clutchesThisCycle++;
-              this.startNextClutch(robot);
-            } else {
-              robot.isBuzzing = false;
-              this.enter(robot, STATE.SLEEP);
+        // if target seems gone, recover
+        if (dNow > 110) fw.shove.farT += dt;
+        else fw.shove.farT = 0;
+        if (fw.shove.farT >= 1.2) {
+          this.enter(robot, STATE.RECOVER);
+          break;
+        }
+
+        if (dNow < 90) fw.shove.closePersistT += dt;
+        else fw.shove.closePersistT = 0;
+
+        const turn = this._turnFromTheta(thetaDeg);
+        const shove = fw.shove;
+        shove.phaseT += dt;
+
+        if (shove.phase === 'PUSH') {
+          const canPush = dNow > (BEHAV.D_HOLD + 10) && dNow > (BEHAV.D_SAFE + 10);
+          if (dNow <= BEHAV.D_SAFE) {
+            this.enter(robot, STATE.PANIC);
+            break;
+          }
+          if (canPush && shove.phaseT <= 0.7) {
+            this._drive(robot, BEHAV.V_PUSH, turn);
+          } else {
+            shove.phase = 'SNAP';
+            shove.phaseT = 0;
+            shove.snapStep = 0;
+            this._drive(robot, 0, 0);
+          }
+        } else if (shove.phase === 'SNAP') {
+          // stop ~200ms + small servo gesture
+          this._drive(robot, 0, 0);
+          if (robot.servo) {
+            if (shove.snapStep === 0) {
+              robot.servo.setTargetDeg(thetaDeg);
+              shove.snapStep = 1;
+            } else if (shove.snapStep === 1 && shove.phaseT > 0.08) {
+              robot.servo.setTargetDeg(thetaDeg + (Math.random() < 0.5 ? -10 : 10));
+              shove.snapStep = 2;
+            } else if (shove.snapStep === 2 && shove.phaseT > 0.16) {
+              robot.servo.setTargetDeg(thetaDeg);
+              shove.snapStep = 3;
             }
           }
-        }
-        break;
-
-      case STATE.AGGRESSION:
-        if (robot.stateTimer >= CFG.AGGRESSION_DURATION) {
-          this.enter(robot, STATE.RETREATING);
-          break;
-        }
-        // If target is lost, rotate-search; classifier will re-trigger AGGRESSION if it re-acquires legs.
-        if (!legsPresent) {
-          // Search behavior (rotation) when target is lost
-          robot.pwmLeft = -0.5;
-          robot.pwmRight = 0.5;
-          if (robot.stateTimer > 3) {
-            this.enter(robot, STATE.RETREATING);
+          if (shove.phaseT >= 0.2) {
+            shove.phase = 'PULL';
+            shove.phaseT = 0;
           }
-          break;
-        }
-        
-        if (!robot.lungePhase || robot.lungePhase === 'done') {
-          robot.lungePhase = 'drive';
-          robot.lungeTimer = randBetween(0.5, 1.0);
-          robot.lungeDriveTime = robot.lungeTimer;
-        }
-        
-        if (robot.lungePhase === 'drive') {
-          robot.lungeTimer -= dt;
-          robot.pwmLeft = 1.0;
-          robot.pwmRight = 1.0;
-          if (robot.lungeTimer <= 0) {
-            robot.lungePhase = 'back';
-            robot.lungeTimer = robot.lungeDriveTime;
-          }
-        } else if (robot.lungePhase === 'back') {
-          robot.lungeTimer -= dt;
-          robot.pwmLeft = -0.8;
-          robot.pwmRight = -0.8;
-          if (robot.lungeTimer <= 0) {
-            robot.lungePhase = 'done';
+        } else if (shove.phase === 'PULL') {
+          // fixed pull duration or until distance relaxed
+          const done = shove.phaseT >= 0.35 || dNow > (BEHAV.D_HOLD + 25);
+          this._drive(robot, -BEHAV.V_PULL, turn * 0.3);
+          if (done) {
+            shove.cyclesDone++;
+            if (shove.cyclesDone >= shove.cyclesTarget) {
+              // Evaluate: if still close and "pressing" for a while → block
+              if (fw.shove.closePersistT >= 1.2) this.enter(robot, STATE.BLOCK);
+              else shove.cyclesDone = 0;
+            }
+            shove.phase = 'PUSH';
+            shove.phaseT = 0;
           }
         }
         break;
+      }
 
-      case STATE.RETREATING:
-        // Back up for a fixed time to return to the clutch area
-        robot.pwmLeft = -0.6;
-        robot.pwmRight = -0.6;
-        if (robot.stateTimer > 2.0) {
-          this.enter(robot, STATE.GUARD);
-        }
-        break;
-
-      case STATE.GUARD:
-        if (legsPresent) {
-          this.enter(robot, STATE.AGGRESSION);
+      case STATE.BLOCK: {
+        // Quick pings while keeping target centered
+        this._updateFrontPing(robot, dt, thetaDeg);
+        const dNow = Math.min(targetCm, scan.frontCm);
+        if (dNow < BEHAV.D_PANIC) {
+          this.enter(robot, STATE.PANIC);
           break;
         }
-        if (robot.stateTimer >= CFG.GUARD_DURATION) {
-          this.enter(robot, STATE.CALMING);
+
+        // exit if target far for 2s
+        if (dNow > 150) fw.block.farT += dt;
+        else fw.block.farT = 0;
+        if (fw.block.farT >= 2.0) {
+          this.enter(robot, STATE.RECOVER);
           break;
         }
-        // Jitter in place
-        robot.jitterTimer -= dt;
-        if (robot.jitterTimer <= 0) {
-          robot.jitterTimer = randBetween(0.5, 1.5);
-          robot.pwmLeft = (Math.random() - 0.5) * 0.8;
-          robot.pwmRight = (Math.random() - 0.5) * 0.8;
-        }
-        break;
 
-      case STATE.CALMING:
-        if (legsPresent) {
-          this.enter(robot, STATE.AGGRESSION);
+        // Distance hold around D_HOLD
+        const e = dNow - BEHAV.D_HOLD;
+        const fwd = clampLocal(e / 80, -0.25, 0.25);
+
+        // Arc sideways based on target side
+        let side = 0;
+        if (thetaDeg > 10) side = 0.18;
+        else if (thetaDeg < -10) side = -0.18;
+
+        // Occasional fake lunge
+        fw.block.fakeLungeT -= dt;
+        if (fw.block.fakeLungeT <= 0) {
+          fw.block.fakeLungeT = 2 + Math.random();
+          fw.block.lungeRem = 0.22;
+        }
+        if (fw.block.lungeRem > 0) {
+          fw.block.lungeRem -= dt;
+          if (dNow > (BEHAV.D_SAFE + 10)) {
+            this._drive(robot, BEHAV.V_APPROACH * 0.6, this._turnFromTheta(thetaDeg));
+            break;
+          }
+        }
+
+        this._drive(robot, fwd, side + this._turnFromTheta(thetaDeg) * 0.6);
+        break;
+      }
+
+      case STATE.LINE_AVOID: {
+        // Immediate stop + short retreat + turn + forward lockout
+        const t = robot.stateTimer;
+        if (t < 0.02) {
+          this._drive(robot, 0, 0);
           break;
         }
-        robot.calmTimer += dt;
-        robot.pwmLeft = 0;
-        robot.pwmRight = 0;
-        
-        if (robot.calmTimer >= CFG.CALM_WAIT && !robot.didPostCalmLay) {
-          robot.didPostCalmLay = true;
-          this.layPostCalmClutch(robot);
+        if (t < 0.37) {
+          this._drive(robot, -0.45, 0);
+          break;
         }
-        if (robot.calmTimer >= CFG.CALM_WAIT + 2) {
-          robot.safeTimer = 0;
-          this.enter(robot, STATE.IDLE_SAFE);
+        if (t < 0.87) {
+          // Choose turn direction using last scan: more space side wins
+          let sumL = 0, sumR = 0;
+          if (scan.filtered) {
+            for (let i = 0; i < scan.angles.length; i++) {
+              const a = scan.angles[i];
+              const v = scan.filtered[i];
+              if (a < 0) sumL += v;
+              else sumR += v;
+            }
+          }
+          const dir = sumR >= sumL ? 1 : -1;
+          this._drive(robot, 0, dir * 0.35);
+          break;
+        }
+        if (t < 1.57) {
+          // lockout (no forward)
+          this._drive(robot, 0, 0);
+          break;
+        }
+
+        // return to previous state (if target still present)
+        const stillNear = (scan.frontCm < BEHAV.D_DETECT) || (targetCm < BEHAV.D_DETECT);
+        if (stillNear && (fw.returnState === STATE.SHOVE || fw.returnState === STATE.BLOCK)) {
+          this.enter(robot, fw.returnState);
+        } else {
+          this.enter(robot, STATE.PATROL);
         }
         break;
-    }
+      }
 
-    this._ensureConstantMotion(robot, dt);
-  },
+      case STATE.PANIC: {
+        const p = fw.panic;
+        p.t += dt;
 
-  _ensureConstantMotion(robot, dt) {
-    if (robot.state === STATE.SLEEP || robot.state === STATE.LAYING) return;
+        if (p.phase === 'STOP') {
+          this._drive(robot, 0, 0);
+          if (p.t >= 0.05) { p.phase = 'REVERSE'; p.t = 0; }
+          break;
+        }
+        if (p.phase === 'REVERSE') {
+          this._drive(robot, -BEHAV.V_PANIC_REV, 0);
+          if (p.t >= 0.4) { p.phase = 'TURN'; p.t = 0; }
+          break;
+        }
+        if (p.phase === 'TURN') {
+          // turn toward open space
+          let dir = 1;
+          if (scan.filtered) {
+            let sumL = 0, sumR = 0;
+            for (let i = 0; i < scan.angles.length; i++) {
+              const a = scan.angles[i];
+              const v = scan.filtered[i];
+              if (a < 0) sumL += v; else sumR += v;
+            }
+            dir = sumR >= sumL ? 1 : -1;
+          }
+          this._drive(robot, 0, dir * 0.35);
+          if (p.t >= 0.5) { p.phase = 'COOLDOWN'; p.t = 0; p.cooldown = 2.0; }
+          break;
+        }
+        if (p.phase === 'COOLDOWN') {
+          p.cooldown -= dt;
+          // slow patrol, no shove
+          this._updateFrontPing(robot, dt, 0);
+          const turn = this._turnFromTheta(0);
+          this._drive(robot, BEHAV.V_PATROL, turn);
+          if (p.cooldown <= 0) this.enter(robot, STATE.PATROL);
+          break;
+        }
+        break;
+      }
 
-    // Update head-scan oscillation phase
-    robot.scanOscPhase += robot.scanOscFreq * 2 * Math.PI * dt;
-    const scanBias = Math.sin(robot.scanOscPhase) * robot.scanOscAmplitude;
-
-    const deadzone = 0.08;
-    if (Math.abs(robot.pwmLeft) < deadzone && Math.abs(robot.pwmRight) < deadzone) {
-      const baseForward = 0.28;
-      const turn = (Math.random() - 0.5) * 0.16;
-      robot.pwmLeft  = baseForward + turn - scanBias;
-      robot.pwmRight = baseForward - turn + scanBias;
-    } else {
-      // Add scan oscillation to existing motion
-      robot.pwmLeft  -= scanBias * 0.5;
-      robot.pwmRight += scanBias * 0.5;
+      case STATE.RECOVER: {
+        this._drive(robot, 0, 0);
+        if (robot.servo) robot.servo.setTargetDeg(0);
+        if (robot.stateTimer >= 0.4) this.enter(robot, STATE.PATROL);
+        break;
+      }
     }
   },
 };

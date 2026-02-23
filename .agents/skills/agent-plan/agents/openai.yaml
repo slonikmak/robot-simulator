@@ -1,4 +1,0 @@
-interface:
-  display_name: "Агент: plan"
-  short_description: "Plan-only PR для Plan Gate (в т.ч. chore)"
-  default_prompt: "Используй $agent-plan, чтобы подготовить plan-only PR (tasks/T-XXXX.md + Fixes/Spec/Plan/Why) и провести задачу через Plan Gate."

@@ -509,13 +509,13 @@ class Renderer {
     // ── State indicator ring ──────────────────────────────
     let stateColor = '#ffffff44';
     switch (robot.state) {
-      case STATE.SLEEP:      stateColor = '#7fb3d388'; break;
-      case STATE.IDLE_SAFE:  stateColor = '#6fcf9788'; break;
-      case STATE.LAYING:     stateColor = '#c19fff';   break;
-      case STATE.AGGRESSION: stateColor = '#ff6b6bee'; break;
-      case STATE.RETREATING: stateColor = '#f5a62399'; break;
-      case STATE.GUARD:      stateColor = '#4fc3f7aa'; break;
-      case STATE.CALMING:    stateColor = '#a5d6a799'; break;
+      case STATE.PATROL:     stateColor = '#6fcf9788'; break;
+      case STATE.ACQUIRE:    stateColor = '#4fc3f7aa'; break;
+      case STATE.SHOVE:      stateColor = '#ff6b6bee'; break;
+      case STATE.BLOCK:      stateColor = '#f5a623cc'; break;
+      case STATE.LINE_AVOID: stateColor = '#e8c84add'; break;
+      case STATE.PANIC:      stateColor = '#ff3b3bee'; break;
+      case STATE.RECOVER:    stateColor = '#a5d6a799'; break;
     }
     ctx.beginPath();
     ctx.arc(0, 0, R * 1.08, 0, 2 * Math.PI);
@@ -540,7 +540,7 @@ class Renderer {
       const rangeR = this.mToPx(Math.min(CFG.ULTRASONIC_RANGE, 3.0));
       ctx.save();
       ctx.translate(sp.x, sp.y);
-      ctx.rotate(h);
+      ctx.rotate(h + (robot.servo ? robot.servo.angle : 0));
       const halfFov = CFG.ULTRASONIC_FOV * 0.5;
       ctx.beginPath();
       ctx.moveTo(0, 0);

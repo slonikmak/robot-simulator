@@ -1,4 +1,0 @@
-interface:
-  display_name: "Агент: capture"
-  short_description: "Создание backlog-issue через gh CLI"
-  default_prompt: "Используй $agent-capture, чтобы создать issue в status:backlog."

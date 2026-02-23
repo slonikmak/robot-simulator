@@ -83,6 +83,15 @@ html, body {
 .state-badge.guard      { background: #1a3a4a; color: #4fc3f7; }
 .state-badge.calming    { background: #2a3a20; color: #a5d6a7; }
 
+/* New FSM (territory + shove) */
+.state-badge.patrol     { background: #1e4d2b; color: #6fcf97; }
+.state-badge.acquire    { background: #1a3a4a; color: #4fc3f7; }
+.state-badge.shove      { background: #5a1a1a; color: #ff6b6b; }
+.state-badge.block      { background: #3a2a10; color: #f5a623; }
+.state-badge.line-avoid { background: #4a400f; color: #e8c84a; }
+.state-badge.panic      { background: #3b1212; color: #ff6b6b; }
+.state-badge.recover    { background: #2a3a20; color: #a5d6a7; }
+
 .divider {
   border-top: 1px solid rgba(255,255,255,0.08);
   margin: 10px 0;

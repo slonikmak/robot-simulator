@@ -66,48 +66,111 @@ class UltrasonicSensor {
     this._lastVal = Infinity;
     this._timer   = 0;
     this._interval = 1 / CFG.ULTRASONIC_HZ;
+
+    this._seq = 0;
+
+    // Environment snapshot (set by Robot.update)
+    this._legsPos   = null;
+    this._obstacles = null;
+
+    // Ping gating (simulate minimum sensor cycle time)
+    this._sincePing = Infinity;
   }
   // dt in *sim* seconds; legsPos = Vec2 cursor position; obstacles = RectObstacle[]
   update(dt, legsPos, obstacles) {
+    this._legsPos   = legsPos;
+    this._obstacles = obstacles;
+
+    this._sincePing += dt;
     this._timer += dt;
     if (this._timer >= this._interval) {
       this._timer -= this._interval;
-
-      const origin = this._robot.pos;
-      const halfFov = CFG.ULTRASONIC_FOV * 0.5;
-      const rayOffsets = [
-        -halfFov,
-        -halfFov * 0.5,
-        0,
-        halfFov * 0.5,
-        halfFov,
-      ];
-
-      let best = Infinity;
-      for (const off of rayOffsets) {
-        const dir = Vec2.fromAngle(this._robot.heading + off, 1);
-
-        // legs hit
-        const tLeg = rayIntersectCircle(origin, dir, legsPos, CFG.LEGS_RADIUS);
-        if (tLeg < best) best = tLeg;
-
-        // obstacles hit
-        for (const o of (obstacles || [])) {
-          const t = rayIntersectAABB(origin, dir, o.minX, o.minY, o.maxX, o.maxY);
-          if (t < best) best = t;
-        }
-      }
-
-      if (best <= CFG.ULTRASONIC_RANGE) {
-        const noise = (Math.random() * 2 - 1) * CFG.ULTRASONIC_NOISE;
-        this._lastVal = Math.max(0, best + noise);
-      } else {
-        this._lastVal = Infinity;
-      }
+      this.ping();
     }
     return this._lastVal;
   }
+
+  // Triggered ultrasonic ping (Arduino-style). Uses last environment snapshot.
+  // Returns distance in metres or Infinity.
+  ping() {
+    if (this._sincePing < CFG.ULTRASONIC_PING_MIN_DT) return this._lastVal;
+    if (!this._legsPos) return this._lastVal;
+
+    // If servo just moved, readings are often unstable; keep last value.
+    if (this._robot.servo && this._robot.servo.timeSinceMove < CFG.SERVO_SETTLE_S) {
+      return this._lastVal;
+    }
+
+    this._sincePing = 0;
+
+    const origin = this._robot.pos;
+    const aim = this._robot.heading + (this._robot.servo ? this._robot.servo.angle : 0);
+    const halfFov = CFG.ULTRASONIC_FOV * 0.5;
+    const rayOffsets = [
+      -halfFov,
+      -halfFov * 0.5,
+      0,
+      halfFov * 0.5,
+      halfFov,
+    ];
+
+    let best = Infinity;
+    for (const off of rayOffsets) {
+      const dir = Vec2.fromAngle(aim + off, 1);
+
+      // legs hit
+      const tLeg = rayIntersectCircle(origin, dir, this._legsPos, CFG.LEGS_RADIUS);
+      if (tLeg < best) best = tLeg;
+
+      // obstacles hit
+      for (const o of (this._obstacles || [])) {
+        const t = rayIntersectAABB(origin, dir, o.minX, o.minY, o.maxX, o.maxY);
+        if (t < best) best = t;
+      }
+    }
+
+    if (best <= CFG.ULTRASONIC_RANGE) {
+      const noise = (Math.random() * 2 - 1) * CFG.ULTRASONIC_NOISE;
+      this._lastVal = Math.max(0, best + noise);
+    } else {
+      this._lastVal = Infinity;
+    }
+    this._seq++;
+    return this._lastVal;
+  }
   get lastMeasurement() { return this._lastVal; }
+  get seq() { return this._seq; }
+}
+
+// ── Simple servo model (angle in radians) ─────────────────────
+class Servo {
+  constructor() {
+    this.angle = 0;      // current angle (rad), relative to robot forward
+    this.target = 0;     // target angle (rad)
+    this.timeSinceMove = 999;
+  }
+
+  setTargetDeg(deg) {
+    const lim = CFG.SERVO_LIMIT_DEG;
+    const clamped = clamp(deg, -lim, lim);
+    this.target = clamped * Math.PI / 180;
+  }
+
+  setTargetRad(rad) {
+    const lim = CFG.SERVO_LIMIT_DEG * Math.PI / 180;
+    this.target = clamp(rad, -lim, lim);
+  }
+
+  update(dt) {
+    const maxSpeed = (CFG.SERVO_MAX_SPEED_DPS * Math.PI / 180); // rad/s
+    const prev = this.angle;
+    const diff = this.target - this.angle;
+    const step = clamp(diff, -maxSpeed * dt, maxSpeed * dt);
+    this.angle += step;
+
+    if (Math.abs(this.angle - prev) > 1e-6) this.timeSinceMove = 0;
+    else this.timeSinceMove += dt;
+  }
 }
 
 // ── Colour sensor (floor line detection) ─────────────────────
@@ -155,11 +218,12 @@ class Robot {
     this.pwmRight = 0;
 
     // Sensors
+    this.servo = new Servo();
     this.ultrasonic = new UltrasonicSensor(this);
     this.colorSensor = new ColorSensor(this);
 
     // FSM
-    this.state     = STATE.IDLE_SAFE;
+    this.state     = STATE.PATROL;
     this.stateTimer = 0; // how long in current state (sim seconds)
 
     // Safe cycle
@@ -214,16 +278,14 @@ class Robot {
 
   // ── Main FSM update ───────────────────────────────────────
   update(dt, legsPos, obstacles) {
+    // Update actuator dynamics first
+    this.servo.update(dt);
+
     // Environment updates the sensor using world legs position.
     this.ultrasonic.update(dt, legsPos, obstacles);
 
     // Firmware sees only sensor readings (no absolute legs position).
     RobotFirmware.updateBehavior(this, dt);
-
-    // ── Boundary override (colour sensor) ──────────────
-    if (this.state !== STATE.SLEEP) {
-      RobotFirmware.applyBoundaryRepulsion(this, dt);
-    }
 
     // ── Integrate differential drive kinematics ─────────
     const { linVel, angVel } = DifferentialDrive.pwmToVelocity(this.pwmLeft, this.pwmRight);

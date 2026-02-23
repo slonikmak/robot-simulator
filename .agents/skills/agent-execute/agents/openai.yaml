@@ -1,4 +1,0 @@
-interface:
-  display_name: "Агент: execute"
-  short_description: "Реализация задачи после plan:approved"
-  default_prompt: "Используй $agent-execute, чтобы реализовать утверждённый план и прогнать тесты."
