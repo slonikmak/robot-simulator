@@ -561,7 +561,6 @@ class Renderer {
     this._w2sInto(legsPos, sp);
     const ctx = this.ctx;
     const r   = this.mToPx(0.06);
-    const now = performance.now() / 1000;
 
     // if legs are off-screen, skip detailed drawing
     if (sp.x < -50 || sp.x > this.canvas.width + 50 ||
@@ -575,7 +574,7 @@ class Renderer {
     offsets.forEach(o => {
       ctx.save();
       ctx.translate(sp.x + o.dx, sp.y + o.dy);
-      ctx.rotate(o.rot + Math.sin(now * 5) * 0.06);
+      ctx.rotate(o.rot);
       ctx.beginPath();
       ctx.ellipse(0, 0, r * 0.55, r * 0.9, 0, 0, 2 * Math.PI);
       ctx.fillStyle = 'rgba(255,220,180,0.85)';
@@ -678,6 +677,7 @@ class Renderer {
 // ── UI helpers ────────────────────────────────────────────────
 const elState   = document.getElementById('state-label');
 const elDist    = document.getElementById('dist-label');
+const elPercept = document.getElementById('percept-label');
 const elClutch  = document.getElementById('clutch-count-label');
 const elLayTmr  = document.getElementById('lay-timer-label');
 const elTimer   = document.getElementById('timer-label');
@@ -692,6 +692,12 @@ function updateUI(robot, timeScale) {
   // show ultrasonic sensor reading instead of legs distance
   const d = robot.ultrasonic.lastMeasurement;
   elDist.textContent = isFinite(d) ? `${d.toFixed(2)} м` : '> 3 м';
+
+  const PERCEPT_LABELS = { empty: '— пусто', scanning: '🔍 сканирует', legs: '🦵 ноги!', wall: '🧱 стена' };
+  const PERCEPT_COLORS = { empty: '#888', scanning: '#f0c040', legs: '#f05050', wall: '#60c0ff' };
+  const pk = robot.percept || 'empty';
+  elPercept.textContent = PERCEPT_LABELS[pk] || pk;
+  elPercept.style.color = PERCEPT_COLORS[pk] || '#888';
 
   const totalEggs = robot.clutches.reduce((a, c) => a + c.eggs.length, 0);
   elClutch.textContent = `${robot.clutches.length} кл. (${totalEggs} икринок)`;

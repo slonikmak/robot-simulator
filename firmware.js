@@ -21,29 +21,29 @@ const STATE_LABELS = {
   CALMING:    '😮‍💨 Успокаивается',
 };
 
-// ── Threat classification (no map, HC-SR04-like distance only) ─────────────
-// We assume the sensor returns only distance (or Infinity). We distinguish
-// legs vs static walls/obstacles using temporal signatures and a short
-// active-probing micro-rotation.
+// ── Threat classification ─────────────────────────────────────────────────────
+// The robot mounts a fixed HC-SR04 (no servo). It cannot aim the sensor
+// independently. Instead, the firmware deliberately oscillates the whole body
+// (scan oscillation) and collects a ring-buffer of distance measurements over
+// one full oscillation sweep. A narrow object like a human leg causes a large
+// distance dispersion (beam sweeps past it → Infinity; hits it → close value).
+// A flat wall causes nearly constant distance across the whole sweep.
+//
+// Detection criteria (computed from the scan window):
+//   dropout_rate >= LEGS_DROPOUT  → beam "lost" the target at some angles  → leg-like
+//   OR spread   >= LEGS_SPREAD    → large distance variation within sweep  → leg-like
 const THREAT_CFG = {
-  SAMPLE_DT: 1 / CFG.ULTRASONIC_HZ,
-  RING_N: 8,
+  NEAR_DIST:     CFG.WAKE_DIST_FROM_BOUNDARY,
+  COOLDOWN_DUR:  1.5,
 
-  NEAR_DIST: CFG.WAKE_DIST_FROM_BOUNDARY,
+  // Ring buffer: collect samples across one full oscillation period
+  // At 15 Hz sensor rate, 1 oscillation ≈ 0.83 s → ~12-13 samples.
+  RING_N:        14,
+  SAMPLE_DT:     1 / CFG.ULTRASONIC_HZ,
 
-  PROBE_DUR: 0.85,
-  PROBE_TOGGLE: 0.18,
-  PROBE_PWM: 0.22,
-
-  COOLDOWN_DUR: 2.0,
-  WALL_AVOID_DUR: 0.9,
-
-  // Heuristics tuned for metres and ULTRASONIC_NOISE ~ 0.02.
-  MOVING_ABS_DERIV: 0.07,    // m/sample, when robot is nearly stationary
-  PROBE_DROPOUT_RATE: 0.20,  // % of samples that became Infinity during probe
-  PROBE_SPREAD: 0.14,        // max-min during probe
-
-  SUSPECT_DUR: 0.35,
+  // Leg signature thresholds
+  LEGS_DROPOUT:  0.30,   // fraction of samples that were Infinity
+  LEGS_SPREAD:   0.25,   // m, max-min of finite readings
 };
 
 const RobotFirmware = {
@@ -51,73 +51,33 @@ const RobotFirmware = {
   _ensureThreatState(robot) {
     if (robot._threat) return;
     robot._threat = {
+      cooldown:    0,
       sampleTimer: 0,
-      ring: new Array(THREAT_CFG.RING_N).fill(Infinity),
-      ringIdx: 0,
-      ringCount: 0,
-
-      phase: 'idle', // idle | probing | cooldown
-      cooldown: 0,
-      wallAvoid: 0,
-      suspect: 0,
-
-      probeTimer: 0,
-      probeToggleTimer: 0,
-      probeSampleTimer: 0,
-      probeDir: 1,
-      probeSamples: 0,
-      probeInf: 0,
-      probeMin: Infinity,
-      probeMax: 0,
-      probeLastFinite: null,
-      probeAbsDerivSum: 0,
+      ring:        new Array(THREAT_CFG.RING_N).fill(Infinity),
+      ringIdx:     0,
+      ringCount:   0,
     };
   },
 
-  _pushThreatSample(threat, dist) {
+  _pushSample(threat, dist) {
     threat.ring[threat.ringIdx] = dist;
     threat.ringIdx = (threat.ringIdx + 1) % THREAT_CFG.RING_N;
     threat.ringCount = Math.min(THREAT_CFG.RING_N, threat.ringCount + 1);
   },
 
-  _ringStats(threat) {
+  _scanStats(threat) {
     const n = threat.ringCount;
-    if (n <= 0) return null;
-
-    let finiteN = 0;
-    let infN = 0;
-    let min = Infinity;
-    let max = 0;
-    let sum = 0;
-    let lastFinite = null;
-    let absDerivSum = 0;
-
+    if (n < 4) return null;   // not enough data yet
+    let finN = 0, infN = 0, minD = Infinity, maxD = 0;
     for (let i = 0; i < n; i++) {
-      const v = threat.ring[i];
-      if (!Number.isFinite(v)) {
-        infN++;
-        continue;
-      }
-      finiteN++;
-      sum += v;
-      if (v < min) min = v;
-      if (v > max) max = v;
-      if (lastFinite != null) absDerivSum += Math.abs(v - lastFinite);
-      lastFinite = v;
+      const idx = (threat.ringIdx - n + i + THREAT_CFG.RING_N) % THREAT_CFG.RING_N;
+      const v = threat.ring[idx];
+      if (Number.isFinite(v)) { finN++; if (v < minD) minD = v; if (v > maxD) maxD = v; }
+      else infN++;
     }
-
-    const mean = finiteN ? (sum / finiteN) : Infinity;
-    const absDerivMean = (finiteN >= 2) ? (absDerivSum / (finiteN - 1)) : 0;
     return {
-      n,
-      finiteN,
-      infN,
-      min,
-      max,
-      mean,
-      absDerivMean,
-      dropoutRate: n ? (infN / n) : 1,
-      spread: (finiteN ? (max - min) : 0),
+      dropoutRate: infN / n,
+      spread: finN >= 2 ? (maxD - minD) : 0,
     };
   },
 
@@ -125,171 +85,57 @@ const RobotFirmware = {
     this._ensureThreatState(robot);
     const threat = robot._threat;
 
-    // Defensive: if dt spikes (tab inactive) or becomes non-finite, avoid
-    // unbounded catch-up loops that can freeze the UI.
-    const dtSample = Number.isFinite(dt) ? Math.min(dt, 0.25) : 0;
-
-    // Timers
     if (threat.cooldown > 0) threat.cooldown = Math.max(0, threat.cooldown - dt);
-    if (threat.wallAvoid > 0) threat.wallAvoid = Math.max(0, threat.wallAvoid - dt);
-    if (threat.suspect > 0) threat.suspect = Math.max(0, threat.suspect - dt);
 
     const dist = robot.ultrasonic.lastMeasurement;
     const near = Number.isFinite(dist) && dist < THREAT_CFG.NEAR_DIST;
 
-    // Keep a sensor-rate ring buffer (so we don't overweight render-frame dt).
-    threat.sampleTimer += dtSample;
+    // Accumulate sensor readings at sensor rate into ring buffer
+    threat.sampleTimer += dt;
     if (threat.sampleTimer >= THREAT_CFG.SAMPLE_DT) {
-      threat.sampleTimer = 0;
-      this._pushThreatSample(threat, dist);
+      threat.sampleTimer -= THREAT_CFG.SAMPLE_DT;
+      // Only record samples when something is near; clear buffer when zone is empty
+      if (near) {
+        this._pushSample(threat, dist);
+      } else {
+        threat.ringCount = 0;
+        threat.ringIdx   = 0;
+      }
     }
 
-    // If already in aggression, classifier is irrelevant.
+    // Already in aggression?
     if (robot.state === STATE.AGGRESSION) {
-      threat.phase = 'idle';
-      threat.probeTimer = 0;
-      threat.probeSamples = 0;
-      return { threat: true, override: false, enterAggression: false };
+      robot.percept = 'legs';
+      return { threat: true, enterAggression: false };
     }
 
-    // Wall avoidance (post-classification) – short and bounded.
-    if (threat.wallAvoid > 0) {
-      // Only apply avoid in states where motion is OK.
-      if (robot.state === STATE.IDLE_SAFE || robot.state === STATE.GUARD || robot.state === STATE.CALMING) {
-        robot.pwmLeft  = -0.55;
-        robot.pwmRight = -0.25;
-        return { threat: false, override: true, enterAggression: false };
-      }
+    if (!near) {
+      robot.percept = 'empty';
+      return { threat: false, enterAggression: false };
     }
 
-    // Suspect window: hold still briefly to observe real target motion.
-    if (threat.suspect > 0) {
-      robot.pwmLeft  = 0;
-      robot.pwmRight = 0;
-
-      const stats = this._ringStats(threat);
-      if (near && stats && stats.finiteN >= 3 && stats.absDerivMean >= THREAT_CFG.MOVING_ABS_DERIV) {
-        threat.suspect = 0;
-        return { threat: true, override: false, enterAggression: true };
-      }
-
-      // If suspect expires without movement, ignore as non-threat.
-      if (threat.suspect <= 0) {
-        threat.cooldown = THREAT_CFG.COOLDOWN_DUR;
-      }
-      return { threat: false, override: true, enterAggression: false };
+    if (threat.cooldown > 0) {
+      robot.percept = 'wall';
+      return { threat: false, enterAggression: false };
     }
 
-    // Probing phase (micro-rotation) to differentiate a small target vs a flat/static surface.
-    if (threat.phase === 'probing') {
-      threat.probeTimer += dt;
-      threat.probeToggleTimer += dt;
-      if (threat.probeToggleTimer >= THREAT_CFG.PROBE_TOGGLE) {
-        threat.probeToggleTimer = 0;
-        threat.probeDir *= -1;
-      }
+    // Wait until we have a full sweep's worth of data before deciding
+    robot.percept = 'scanning';
+    const stats = this._scanStats(threat);
+    if (!stats) return { threat: false, enterAggression: false };
 
-      // Sample at sensor rate during probe.
-      threat.probeSampleTimer += dtSample;
-      if (threat.probeSampleTimer >= THREAT_CFG.SAMPLE_DT) {
-        threat.probeSampleTimer = 0;
-        // Note: dist is the latest measurement; sensor model updates independently.
-        // We'll treat Infinity as a dropout.
-        if (Number.isFinite(dist)) {
-          threat.probeSamples++;
-          if (dist < threat.probeMin) threat.probeMin = dist;
-          if (dist > threat.probeMax) threat.probeMax = dist;
-          if (threat.probeLastFinite != null) {
-            threat.probeAbsDerivSum += Math.abs(dist - threat.probeLastFinite);
-          }
-          threat.probeLastFinite = dist;
-        } else {
-          threat.probeSamples++;
-          threat.probeInf++;
-        }
-      }
-
-      // Override motion: rotate in place.
-      const p = THREAT_CFG.PROBE_PWM * threat.probeDir;
-      robot.pwmLeft  = -p;
-      robot.pwmRight =  p;
-
-      if (threat.probeTimer < THREAT_CFG.PROBE_DUR) {
-        return { threat: false, override: true, enterAggression: false };
-      }
-
-      // Decide
-      const n = Math.max(1, threat.probeSamples);
-      const dropoutRate = threat.probeInf / n;
-      const spread = (Number.isFinite(threat.probeMin) && Number.isFinite(threat.probeMax)) ? (threat.probeMax - threat.probeMin) : 0;
-
-      let legsScore = 0;
-      if (dropoutRate >= THREAT_CFG.PROBE_DROPOUT_RATE) legsScore++;
-      if (spread >= THREAT_CFG.PROBE_SPREAD) legsScore++;
-
-      // Reset probe state
-      threat.phase = 'idle';
-      threat.probeTimer = 0;
-      threat.probeToggleTimer = 0;
-      threat.probeSampleTimer = 0;
-      threat.probeDir = 1;
-      threat.probeSamples = 0;
-      threat.probeInf = 0;
-      threat.probeMin = Infinity;
-      threat.probeMax = 0;
-      threat.probeLastFinite = null;
-      threat.probeAbsDerivSum = 0;
-
-      if (legsScore >= 1) {
-        // Not a wall-like surface (small/edge target). Do NOT attack yet:
-        // require real motion in the distance stream (R-011).
-        threat.suspect = THREAT_CFG.SUSPECT_DUR;
-        return { threat: false, override: true, enterAggression: false };
-      }
-
-      // Classified as static surface (wall/obstacle) – apply cooldown & optional avoid.
-      threat.cooldown = THREAT_CFG.COOLDOWN_DUR;
-      threat.wallAvoid = THREAT_CFG.WALL_AVOID_DUR;
-      return { threat: false, override: true, enterAggression: false };
+    // Leg signature: narrow object → beam misses it often OR large spread
+    if (stats.dropoutRate >= THREAT_CFG.LEGS_DROPOUT || stats.spread >= THREAT_CFG.LEGS_SPREAD) {
+      robot.percept = 'legs';
+      threat.ringCount = 0;   // reset for next detection
+      return { threat: true, enterAggression: true };
     }
 
-    // Not probing.
-    if (!near) return { threat: false, override: false, enterAggression: false };
-    if (threat.cooldown > 0) return { threat: false, override: false, enterAggression: false };
-
-    // Fast-path: if the distance stream changes a lot while the robot is nearly
-    // stationary, it's likely a moving target (legs).
-    const stats = this._ringStats(threat);
-    if (stats && stats.finiteN >= 3) {
-      const nearlyStationary = Math.abs(robot.pwmLeft) < 0.18 && Math.abs(robot.pwmRight) < 0.18;
-      if (nearlyStationary && stats.absDerivMean >= THREAT_CFG.MOVING_ABS_DERIV) {
-        return { threat: true, override: false, enterAggression: true };
-      }
-    }
-
-    // In states where the robot should remain stationary, do not initiate an
-    // active probe: rely only on the movement signature above.
-    if (robot.state === STATE.SLEEP || robot.state === STATE.LAYING) {
-      return { threat: false, override: false, enterAggression: false };
-    }
-
-    // Otherwise start probe.
-    threat.phase = 'probing';
-    threat.probeTimer = 0;
-    threat.probeToggleTimer = 0;
-    threat.probeSampleTimer = 0;
-    threat.probeDir = 1;
-    threat.probeSamples = 0;
-    threat.probeInf = 0;
-    threat.probeMin = Infinity;
-    threat.probeMax = 0;
-    threat.probeLastFinite = null;
-    threat.probeAbsDerivSum = 0;
-    // Immediately override this tick.
-    const p = THREAT_CFG.PROBE_PWM;
-    robot.pwmLeft  = -p;
-    robot.pwmRight =  p;
-    return { threat: false, override: true, enterAggression: false };
+    // Wall signature: near but uniform readings → apply cooldown
+    robot.percept = 'wall';
+    threat.cooldown = THREAT_CFG.COOLDOWN_DUR;
+    threat.ringCount = 0;
+    return { threat: false, enterAggression: false };
   },
 
   enter(robot, newState) {
@@ -379,10 +225,9 @@ const RobotFirmware = {
     if (threatDecision.enterAggression && robot.state !== STATE.AGGRESSION) {
       this.enter(robot, STATE.AGGRESSION);
     }
-    if (threatDecision.override && robot.state !== STATE.AGGRESSION) {
-      // Probing/avoidance takes control for this tick.
-      return;
-    }
+
+    const ultraDist   = robot.ultrasonic.lastMeasurement;
+    const legsPresent  = Number.isFinite(ultraDist) && ultraDist < THREAT_CFG.NEAR_DIST;
 
     switch (robot.state) {
       case STATE.SLEEP:
@@ -445,9 +290,7 @@ const RobotFirmware = {
           break;
         }
         // If target is lost, rotate-search; classifier will re-trigger AGGRESSION if it re-acquires legs.
-        const ultraDist = robot.ultrasonic.lastMeasurement;
-        const legsVisibleNow = Number.isFinite(ultraDist) && ultraDist < THREAT_CFG.NEAR_DIST;
-        if (!legsVisibleNow) {
+        if (!legsPresent) {
           // Search behavior (rotation) when target is lost
           robot.pwmLeft = -0.5;
           robot.pwmRight = 0.5;
@@ -526,6 +369,28 @@ const RobotFirmware = {
           this.enter(robot, STATE.IDLE_SAFE);
         }
         break;
+    }
+
+    this._ensureConstantMotion(robot, dt);
+  },
+
+  _ensureConstantMotion(robot, dt) {
+    if (robot.state === STATE.SLEEP || robot.state === STATE.LAYING) return;
+
+    // Update head-scan oscillation phase
+    robot.scanOscPhase += robot.scanOscFreq * 2 * Math.PI * dt;
+    const scanBias = Math.sin(robot.scanOscPhase) * robot.scanOscAmplitude;
+
+    const deadzone = 0.08;
+    if (Math.abs(robot.pwmLeft) < deadzone && Math.abs(robot.pwmRight) < deadzone) {
+      const baseForward = 0.28;
+      const turn = (Math.random() - 0.5) * 0.16;
+      robot.pwmLeft  = baseForward + turn - scanBias;
+      robot.pwmRight = baseForward - turn + scanBias;
+    } else {
+      // Add scan oscillation to existing motion
+      robot.pwmLeft  -= scanBias * 0.5;
+      robot.pwmRight += scanBias * 0.5;
     }
   },
 };

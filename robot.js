@@ -200,6 +200,14 @@ class Robot {
     // Boundary avoidance timer
     this.boundaryAvoidTimer = 0;
 
+    // Percept: what the robot currently thinks it sees ('empty'|'scanning'|'legs'|'wall')
+    this.percept = 'empty';
+
+    // Continuous head-scan oscillation (micro-rotation for constant spatial awareness)
+    this.scanOscPhase = 0;
+    this.scanOscFreq = 1.2; // Hz
+    this.scanOscAmplitude = 0.25; // radians (~14°)
+
     // Visual
     this.vibrate = new Vec2(0, 0); // vibration offset
   }
