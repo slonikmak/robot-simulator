@@ -92,6 +92,12 @@ let camY   = 0;
 let isPanning = false;
 let panStartX, panStartY, panCamX0, panCamY0;
 
+// Touch pan/pinch state (mobile)
+let touchPanActive = false;
+let touchPanStartX, touchPanStartY, touchPanCamX0, touchPanCamY0;
+let pinchStartDist = 0, pinchStartPpm = 0;
+let pinchMidX = 0, pinchMidY = 0, pinchCamX0 = 0, pinchCamY0 = 0;
+
 // Mouse world position
 let mouseWorldX = 0;
 let mouseWorldY = 0;
@@ -101,7 +107,10 @@ let mouseWorldY = 0;
 function setup() {
   const cnv = createCanvas(windowWidth, windowHeight);
   cnv.parent('canvas-wrapper');
-  cnv.elt.addEventListener('wheel', onWheel, { passive: false });
+  cnv.elt.addEventListener('wheel',      onWheel,       { passive: false });
+  cnv.elt.addEventListener('touchstart',  onTouchStart,  { passive: false });
+  cnv.elt.addEventListener('touchmove',   onTouchMove,   { passive: false });
+  cnv.elt.addEventListener('touchend',    onTouchEnd,    { passive: false });
 
   // Centre the room in the viewport initially
   const scaleX = (windowWidth  * 0.85) / CFG.ROOM_W;
@@ -175,7 +184,7 @@ function draw() {
   updatePanel(sensors);
   drawCursor();
 
-  if (DEBUG) drawDebugOverlay();
+  if (DEBUG && window.innerWidth > 768) drawDebugOverlay();
 }
 
 
@@ -662,6 +671,7 @@ function mouseDragged() {
   if (isPanning) {
     camX = panCamX0 - (mouseX - panStartX) / ppm;
     camY = panCamY0 - (mouseY - panStartY) / ppm;
+    clampCamera();
   }
 }
 
@@ -671,12 +681,96 @@ function onWheel(e) {
   const factor = e.deltaY < 0 ? 1.1 : 0.9;
   // Zoom toward mouse position
   const mw = screenToWorld(mouseX, mouseY);
-  ppm *= factor;
-  ppm = constrain(ppm, 5, 300);
+  ppm = constrain(ppm * factor, getMinPpm(), 300);
   // Re-anchor so that mouse world point stays under cursor
   const mwAfter = screenToWorld(mouseX, mouseY);
   camX += mw.x - mwAfter.x;
   camY += mw.y - mwAfter.y;
+  clampCamera();
+}
+
+// ── Mobile touch handlers ──────────────────────────
+
+function getMinPpm() {
+  if (window.innerWidth > 768) return 5; // desktop: free zoom
+  // Mobile: don't allow zooming out past whole-room view
+  return Math.min(windowWidth * 0.85 / CFG.ROOM_W, windowHeight * 0.85 / CFG.ROOM_H);
+}
+
+function clampCamera() {
+  const halfW = width  / (2 * ppm);
+  const halfH = height / (2 * ppm);
+  // When zoomed in enough, clamp so room edges don't leave the screen
+  if (CFG.ROOM_W >= 2 * halfW) {
+    camX = constrain(camX, halfW, CFG.ROOM_W - halfW);
+  } else {
+    camX = CFG.ROOM_W / 2; // room fits — keep centred
+  }
+  if (CFG.ROOM_H >= 2 * halfH) {
+    camY = constrain(camY, halfH, CFG.ROOM_H - halfH);
+  } else {
+    camY = CFG.ROOM_H / 2;
+  }
+}
+
+function onTouchStart(e) {
+  e.preventDefault();
+  if (e.touches.length === 1) {
+    touchPanActive  = true;
+    touchPanStartX  = e.touches[0].clientX;
+    touchPanStartY  = e.touches[0].clientY;
+    touchPanCamX0   = camX;
+    touchPanCamY0   = camY;
+  } else if (e.touches.length === 2) {
+    touchPanActive  = false;
+    const t0 = e.touches[0], t1 = e.touches[1];
+    pinchStartDist  = Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY);
+    pinchStartPpm   = ppm;
+    pinchMidX       = (t0.clientX + t1.clientX) / 2;
+    pinchMidY       = (t0.clientY + t1.clientY) / 2;
+    // world point under pinch centre — stays fixed during pinch
+    const wm        = screenToWorld(pinchMidX, pinchMidY);
+    pinchCamX0      = wm.x;
+    pinchCamY0      = wm.y;
+  }
+}
+
+function onTouchMove(e) {
+  e.preventDefault();
+  if (e.touches.length === 1 && touchPanActive) {
+    const dx = e.touches[0].clientX - touchPanStartX;
+    const dy = e.touches[0].clientY - touchPanStartY;
+    camX = touchPanCamX0 - dx / ppm;
+    camY = touchPanCamY0 - dy / ppm;
+    clampCamera();
+  } else if (e.touches.length === 2) {
+    const t0 = e.touches[0], t1 = e.touches[1];
+    const dist = Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY);
+    if (pinchStartDist > 0) {
+      const newPpm = constrain(pinchStartPpm * dist / pinchStartDist, getMinPpm(), 300);
+      const curMidX = (t0.clientX + t1.clientX) / 2;
+      const curMidY = (t0.clientY + t1.clientY) / 2;
+      ppm  = newPpm;
+      // Keep the original world point anchored under the pinch centre
+      camX = pinchCamX0 - (curMidX - width  / 2) / ppm;
+      camY = pinchCamY0 - (curMidY - height / 2) / ppm;
+      clampCamera();
+    }
+  }
+}
+
+function onTouchEnd(e) {
+  e.preventDefault();
+  if (e.touches.length === 0) {
+    touchPanActive = false;
+  } else if (e.touches.length === 1) {
+    // Finger lifted from a pinch — resume single-finger pan
+    touchPanActive = true;
+    touchPanStartX = e.touches[0].clientX;
+    touchPanStartY = e.touches[0].clientY;
+    touchPanCamX0  = camX;
+    touchPanCamY0  = camY;
+  }
 }
 
 function windowResized() {
