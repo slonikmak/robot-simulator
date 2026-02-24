@@ -1,781 +1,710 @@
-// ============================================================
-//  Exhibition Robot Simulator
-//  Top-down view, Arduino-style behaviour, differential drive,
-//  simulated ultrasonic + colour-sensor.
-// ============================================================
-
 'use strict';
 
-// ── Helpers ───────────────────────────────────────────────────
-function lerp(a, b, t) { return a + (b - a) * t; }
-function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
-function randBetween(a, b) { return a + Math.random() * (b - a); }
-function randSign() { return Math.random() < 0.5 ? 1 : -1; }
-function normaliseAngle(a) {
-  while (a >  Math.PI) a -= 2 * Math.PI;
-  while (a < -Math.PI) a += 2 * Math.PI;
-  return a;
-}
+// ─────────────────────────────────────────────
+//  p5.js sketch — simulation loop, rendering,
+//  input handling, and UI updates.
+//  All world-to-screen transforms go through
+//  worldToScreen() so zoom/pan is consistent.
+// ─────────────────────────────────────────────
 
-// ── Geometry helpers (ray casts / collisions) ─────────────────
-function rayIntersectCircle(origin, dir, center, radius) {
-  // dir should be normalized; returns t >= 0 (meters) or Infinity
-  const fx = origin.x - center.x;
-  const fy = origin.y - center.y;
-  const b  = 2 * (fx * dir.x + fy * dir.y);
-  const c  = (fx * fx + fy * fy) - radius * radius;
-  const disc = b * b - 4 * c;
-  if (disc < 0) return Infinity;
-  const s = Math.sqrt(disc);
-  const t1 = (-b - s) / 2;
-  const t2 = (-b + s) / 2;
-  if (t1 >= 0) return t1;
-  if (t2 >= 0) return t2;
-  return Infinity;
-}
+// Simulation objects (initialised in setup)
+let world, robot, firmware;
 
-function rayIntersectAABB(origin, dir, minX, minY, maxX, maxY) {
-  // Returns t >= 0 to first intersection with AABB or Infinity.
-  let tmin = -Infinity;
-  let tmax = Infinity;
-
-  if (Math.abs(dir.x) < 1e-9) {
-    if (origin.x < minX || origin.x > maxX) return Infinity;
-  } else {
-    const tx1 = (minX - origin.x) / dir.x;
-    const tx2 = (maxX - origin.x) / dir.x;
-    tmin = Math.max(tmin, Math.min(tx1, tx2));
-    tmax = Math.min(tmax, Math.max(tx1, tx2));
+// debug log buffer
+const DEBUG = true;
+let debugLog = [];
+function dbg(msg) {
+  if (DEBUG) {
+    console.log('[DBG]', msg);
+    debugLog.push(msg);
+    if (debugLog.length > 40) debugLog.shift();
   }
-
-  if (Math.abs(dir.y) < 1e-9) {
-    if (origin.y < minY || origin.y > maxY) return Infinity;
-  } else {
-    const ty1 = (minY - origin.y) / dir.y;
-    const ty2 = (maxY - origin.y) / dir.y;
-    tmin = Math.max(tmin, Math.min(ty1, ty2));
-    tmax = Math.min(tmax, Math.max(ty1, ty2));
-  }
-
-  if (tmax < 0 || tmin > tmax) return Infinity;
-  return tmin >= 0 ? tmin : tmax >= 0 ? 0 : Infinity;
 }
 
-function resolveCircleVsAABB(circlePos, circleRadius, minX, minY, maxX, maxY) {
-  const closestX = clamp(circlePos.x, minX, maxX);
-  const closestY = clamp(circlePos.y, minY, maxY);
-  let dx = circlePos.x - closestX;
-  let dy = circlePos.y - closestY;
-  const d2 = dx * dx + dy * dy;
-  const r2 = circleRadius * circleRadius;
-  if (d2 >= r2) return false;
+// ── Tools ─────────────────────────────────────
 
-  if (d2 > 1e-12) {
-    const d = Math.sqrt(d2);
-    const push = (circleRadius - d);
-    dx /= d;
-    dy /= d;
-    circlePos.x += dx * push;
-    circlePos.y += dy * push;
-    return true;
-  }
-
-  // Circle center is inside the AABB; push it out via smallest axis.
-  const toLeft   = circlePos.x - minX;
-  const toRight  = maxX - circlePos.x;
-  const toTop    = circlePos.y - minY;
-  const toBottom = maxY - circlePos.y;
-  const m = Math.min(toLeft, toRight, toTop, toBottom);
-  if (m === toLeft)      circlePos.x = minX - circleRadius;
-  else if (m === toRight)  circlePos.x = maxX + circleRadius;
-  else if (m === toTop)    circlePos.y = minY - circleRadius;
-  else                     circlePos.y = maxY + circleRadius;
-  return true;
-}
-
-// ── Vec2 ──────────────────────────────────────────────────────
-class Vec2 {
-  constructor(x = 0, y = 0) { this.x = x; this.y = y; }
-  add(v)       { return new Vec2(this.x + v.x, this.y + v.y); }
-  sub(v)       { return new Vec2(this.x - v.x, this.y - v.y); }
-  scale(s)     { return new Vec2(this.x * s, this.y * s); }
-  len()        { return Math.hypot(this.x, this.y); }
-  norm()       { const l = this.len(); return l > 1e-9 ? this.scale(1 / l) : new Vec2(0, 0); }
-  dot(v)       { return this.x * v.x + this.y * v.y; }
-  angle()      { return Math.atan2(this.y, this.x); }
-  distTo(v)    { return this.sub(v).len(); }
-  clone()      { return new Vec2(this.x, this.y); }
-  set(v)       { this.x = v.x; this.y = v.y; return this; }
-  static fromAngle(a, l = 1) { return new Vec2(Math.cos(a) * l, Math.sin(a) * l); }
-}
-
-// ── Obstacles (axis-aligned rectangles) ───────────────────────
-class RectObstacle {
-  constructor(cx, cy, w, h) {
-    this.cx = cx;
-    this.cy = cy;
-    this.w  = w;
-    this.h  = h;
-  }
-  get minX() { return this.cx - this.w * 0.5; }
-  get maxX() { return this.cx + this.w * 0.5; }
-  get minY() { return this.cy - this.h * 0.5; }
-  get maxY() { return this.cy + this.h * 0.5; }
-}
-
-const OBSTACLES = (() => {
-  const W = CFG.ROOM_WIDTH;
-  const H = CFG.ROOM_HEIGHT;
-  const T = CFG.WALL_THICKNESS;
-  return [
-    // 20x10 Rectangular room centered at 0,0
-    new RectObstacle(0, -H * 0.5, W + T, T), // Top wall
-    new RectObstacle(0,  H * 0.5, W + T, T), // Bottom wall
-    new RectObstacle(-W * 0.5, 0, T, H + T), // Left wall
-    new RectObstacle( W * 0.5, 0, T, H + T), // Right wall
-  ];
-})();
-
-// ── Camera ────────────────────────────────────────────────────
-const camera = {
-  x: 0, y: 0,     // world position of canvas centre
-  zoom: 1.0,
+const TOOL = {
+  CURSOR: 'cursor',       // dynamic legs follow mouse
+  LEGS: 'legs',           // place a pinned pair of legs
+  BAGS: 'bags',           // place a bag obstacle
+  PEDESTALS: 'pedestals', // place a round pedestal
 };
 
-function worldToScreen(wx, wy, canvas) {
-  const cx = canvas.width  / 2;
-  const cy = canvas.height / 2;
-  const scale = CFG.PX_PER_METER_DEFAULT * camera.zoom;
-  return {
-    x: cx + (wx - camera.x) * scale,
-    y: cy + (wy - camera.y) * scale,
-  };
+let activeTool = TOOL.CURSOR;
+
+let simSpeedTarget = 1.0;
+let simSpeed = 1.0;
+
+function setTool(tool) {
+  if (!Object.values(TOOL).includes(tool)) return;
+  activeTool = tool;
+
+  const btns = document.querySelectorAll('.tool-btn[data-tool]');
+  for (const b of btns) {
+    b.classList.toggle('is-active', b.dataset.tool === tool);
+  }
 }
 
-function screenToWorld(sx, sy, canvas) {
-  const cx = canvas.width  / 2;
-  const cy = canvas.height / 2;
-  const scale = CFG.PX_PER_METER_DEFAULT * camera.zoom;
-  return {
-    x: (sx - cx) / scale + camera.x,
-    y: (sy - cy) / scale + camera.y,
-  };
+function initToolsUI() {
+  const btns = document.querySelectorAll('.tool-btn[data-tool]');
+  for (const b of btns) {
+    b.addEventListener('click', () => setTool(b.dataset.tool));
+  }
+
+  const clearBtn = document.getElementById('tool-clear');
+  if (clearBtn) {
+    clearBtn.addEventListener('click', () => {
+      world.clearPlaced();
+      dbg('cleared placed props');
+    });
+  }
+
+  const aliveToggle = document.getElementById('toggle-alive');
+  if (aliveToggle) {
+    aliveToggle.addEventListener('change', () => {
+      world.setAliveEnabled(!!aliveToggle.checked);
+      dbg(`alive props: ${aliveToggle.checked ? 'on' : 'off'}`);
+    });
+  }
+
+  const speedVal = document.getElementById('sim-speed');
+  const speedSlider = document.getElementById('speed-slider');
+  if (speedSlider) {
+    speedSlider.min = String(CFG.SIM_SPEED_MIN ?? 0.25);
+    speedSlider.max = String(CFG.SIM_SPEED_MAX ?? 3.0);
+    speedSlider.step = '0.05';
+    speedSlider.value = '1';
+
+    const update = () => {
+      const v = Number(speedSlider.value);
+      if (Number.isFinite(v)) simSpeedTarget = v;
+      if (speedVal) speedVal.textContent = `${(simSpeedTarget ?? 1).toFixed(2)}×`;
+    };
+    speedSlider.addEventListener('input', update);
+    update();
+  }
 }
 
-// ── Renderer ──────────────────────────────────────────────────
-class Renderer {
-  constructor(canvas) {
-    this.canvas = canvas;
-    this.ctx    = canvas.getContext('2d');
+// View transform
+let ppm    = 40;   // pixels per metre (zoom)
+let camX   = 0;    // camera offset in world metres (pan)
+let camY   = 0;
+let isPanning = false;
+let panStartX, panStartY, panCamX0, panCamY0;
 
-    // cache gradients per zoom
-    this._cachedZoom = null;
-    this._bodyGrad   = null;
-    this._headGrad   = null;
+// Mouse world position
+let mouseWorldX = 0;
+let mouseWorldY = 0;
 
-    // offscreen buffer for static elements (zone + walls)
-    this._staticCanvas = document.createElement('canvas');
-    this._staticZoom   = null;
-    this._staticSize   = { w: 0, h: 0 };
+// ── p5 lifecycle ─────────────────────────────
 
-    // scratch vectors to avoid frequent allocations
-    this._tmpV1 = new Vec2();
-    this._tmpV2 = new Vec2();
-  }
+function setup() {
+  const cnv = createCanvas(windowWidth, windowHeight);
+  cnv.parent('canvas-wrapper');
+  cnv.elt.addEventListener('wheel', onWheel, { passive: false });
 
-  resize() {
-    this.canvas.width  = window.innerWidth;
-    this.canvas.height = window.innerHeight;
-  }
+  // Centre the room in the viewport initially
+  const scaleX = (windowWidth  * 0.85) / CFG.ROOM_W;
+  const scaleY = (windowHeight * 0.85) / CFG.ROOM_H;
+  ppm = Math.min(scaleX, scaleY);
+  camX = CFG.ROOM_W / 2;
+  camY = CFG.ROOM_H / 2;
 
-  // Metre → pixel scale factor
-  get scale() { return CFG.PX_PER_METER_DEFAULT * camera.zoom; }
+  // Create simulation objects
+  world    = new World();
+  robot    = new Robot(CFG.ROOM_W / 2, CFG.ROOM_H / 2, 0);
+  firmware = new Firmware(robot);
+  initToolsUI();
+  setTool(activeTool);
 
-  mToPx(m) { return m * this.scale; }
+  // Hide default cursor on canvas
+  noCursor();
+  frameRate(60);
+  textFont('monospace');
+}
 
-  // Convert world Vec2 (or x,y) to screen coords
-  w2s(v) {
-    const r = worldToScreen(v.x, v.y, this.canvas);
-    return new Vec2(r.x, r.y);
-  }
+function draw() {
+  const dtRaw = Math.min(deltaTime / 1000, 0.05);  // cap at 50 ms
 
-  // version that writes into an existing Vec2 to avoid allocation
-  _w2sInto(v, out) {
-    const r = worldToScreen(v.x, v.y, this.canvas);
-    out.x = r.x;
-    out.y = r.y;
-    return out;
-  }
+  // ── Update mouse world position ──
+  mouseWorldX = screenToWorld(mouseX, mouseY).x;
+  mouseWorldY = screenToWorld(mouseX, mouseY).y;
 
-  // ── Draw zone ─────────────────────────────────────────
-  drawZone() {
-    // this function now only paints to current ctx; called by _renderStatic
-    const ctx = this.ctx;
-    const c   = this.w2s(new Vec2(CFG.ZONE_CENTER_X, CFG.ZONE_CENTER_Y));
-    const R   = this.mToPx(CFG.ZONE_RADIUS);
-
-    // Floor fill (light concrete)
-    ctx.save();
-    ctx.beginPath();
-    ctx.arc(c.x, c.y, R, 0, 2 * Math.PI);
-    ctx.fillStyle = '#2a2a1e';
-    ctx.fill();
-
-    // Floor tile grid (subtle)
-    ctx.clip();
-    ctx.strokeStyle = 'rgba(255,255,255,0.04)';
-    ctx.lineWidth   = 1;
-    const tileM  = 0.5; // 50 cm grid
-    const tilePx = this.mToPx(tileM);
-    const startX = c.x - R - tilePx;
-    const startY = c.y - R - tilePx;
-    ctx.beginPath();
-    for (let x = startX; x <= c.x + R + tilePx; x += tilePx) {
-      ctx.moveTo(x, startY);
-      ctx.lineTo(x, c.y + R + tilePx);
-    }
-    for (let y = startY; y <= c.y + R + tilePx; y += tilePx) {
-      ctx.moveTo(startX, y);
-      ctx.lineTo(c.x + R + tilePx, y);
-    }
-    ctx.stroke();
-    ctx.restore();
-
-    // Boundary marking (thick coloured line on floor)
-    ctx.beginPath();
-    ctx.arc(c.x, c.y, R, 0, 2 * Math.PI);
-    ctx.strokeStyle = '#e8c84a';
-    ctx.lineWidth   = Math.max(3, this.mToPx(0.04));
-    ctx.setLineDash([this.mToPx(0.18), this.mToPx(0.09)]);
-    ctx.stroke();
-    ctx.setLineDash([]);
-
-    // Inner safety "trigger" ring (faint) – only if wake distance < zone radius
-    const wakeRi = CFG.ZONE_RADIUS - CFG.WAKE_DIST_FROM_BOUNDARY;
-    if (wakeRi > 0) {
-      const Ri = this.mToPx(wakeRi);
-      ctx.beginPath();
-      ctx.arc(c.x, c.y, Ri, 0, 2 * Math.PI);
-      ctx.strokeStyle = 'rgba(255,100,100,0.14)';
-      ctx.lineWidth   = 1.5;
-      ctx.setLineDash([this.mToPx(0.1), this.mToPx(0.12)]);
-      ctx.stroke();
-      ctx.setLineDash([]);
-    }
-
-    // Labels
-    const labelR = R + this.mToPx(0.12);
-    ctx.font      = `${Math.max(10, this.mToPx(0.11))}px 'Segoe UI',sans-serif`;
-    ctx.fillStyle = '#e8c84a88';
-    ctx.textAlign = 'center';
-    const diameter = (CFG.ZONE_RADIUS * 2).toFixed(1);
-    ctx.fillText(`⌀ ${diameter} м (зона обитания)`, c.x, c.y - labelR);
-  }
-
-  // ── Draw obstacles ───────────────────────────────────
-  drawObstacles(obstacles) {
-    if (!obstacles || !obstacles.length) return;
-    const ctx = this.ctx;
-    ctx.save();
-    for (const o of obstacles) {
-      const tl = this.w2s(new Vec2(o.minX, o.minY));
-      const br = this.w2s(new Vec2(o.maxX, o.maxY));
-      const w = br.x - tl.x;
-      const h = br.y - tl.y;
-
-      // Wall body
-      ctx.fillStyle = 'rgba(70, 90, 120, 0.55)';
-      ctx.strokeStyle = 'rgba(120, 170, 255, 0.35)';
-      ctx.lineWidth = Math.max(1, this.mToPx(0.01));
-      ctx.beginPath();
-      ctx.rect(tl.x, tl.y, w, h);
-      ctx.fill();
-      ctx.stroke();
-
-      // Subtle highlight edge (top)
-      ctx.strokeStyle = 'rgba(255,255,255,0.10)';
-      ctx.lineWidth = Math.max(1, this.mToPx(0.006));
-      ctx.beginPath();
-      ctx.moveTo(tl.x, tl.y);
-      ctx.lineTo(tl.x + w, tl.y);
-      ctx.stroke();
-    }
-    ctx.restore();
-  }
-
-  // ── Draw egg clutches ─────────────────────────────────
-  drawClutches(clutches, activeIdx) {
-    clutches.forEach((clutch, ci) => {
-      const isActive = ci === activeIdx;
-      clutch.eggs.forEach(egg => {
-        const sp = this._tmpV1;
-        this._w2sInto(egg.pos, sp);
-        const r  = this.mToPx(egg.radius);
-        const prevAlpha = this.ctx.globalAlpha;
-        this.ctx.globalAlpha = egg.alpha * 0.92;
-        this.ctx.beginPath();
-        this.ctx.ellipse(sp.x, sp.y, r * 1.3, r, 0, 0, 2 * Math.PI);
-        this.ctx.fillStyle   = egg.color;
-        this.ctx.strokeStyle = 'rgba(0,0,0,0.4)';
-        this.ctx.lineWidth   = 0.8;
-        this.ctx.fill();
-        this.ctx.stroke();
-        this.ctx.globalAlpha = prevAlpha;
-      });
-
-      // Active clutch: glow ring
-      if (isActive && clutch.eggs.length > 0) {
-        const sp = this.w2s(clutch.center);
-        const r  = this.mToPx(0.1);
-        const g  = this.ctx.createRadialGradient(sp.x, sp.y, 0, sp.x, sp.y, r * 2);
-        g.addColorStop(0, 'rgba(180,255,120,0.22)');
-        g.addColorStop(1, 'rgba(180,255,120,0)');
-        this.ctx.beginPath();
-        this.ctx.arc(sp.x, sp.y, r * 2, 0, 2 * Math.PI);
-        this.ctx.fillStyle = g;
-        this.ctx.fill();
+  // ── Update world (visitor legs follow mouse) ──
+  if (activeTool === TOOL.CURSOR) {
+    if (mouseX > 0 && mouseX < width && mouseY > 0 && mouseY < height) {
+      const insideRoom =
+        mouseWorldX >= 0 && mouseWorldX <= CFG.ROOM_W &&
+        mouseWorldY >= 0 && mouseWorldY <= CFG.ROOM_H;
+      if (insideRoom) {
+        world.setLegsAt(mouseWorldX, mouseWorldY);
+      } else {
+        world.hideLegs();
       }
-    });
-  }
-
-  // ── Draw flying egg particles ─────────────────────────
-  drawParticles(particles) {
-    particles.forEach(p => {
-      const sp = this._tmpV1;
-      this._w2sInto(p.pos, sp);
-      const r  = this.mToPx(p.r);
-      const alpha = (1 - p.t) * 0.9;
-      const prevAlpha = this.ctx.globalAlpha;
-      this.ctx.globalAlpha = alpha;
-      this.ctx.beginPath();
-      this.ctx.ellipse(sp.x, sp.y, r * 1.3, r, p.t * Math.PI, 0, 2 * Math.PI);
-      this.ctx.fillStyle   = `hsl(${90 + p.t * 30}, 65%, 58%)`;
-      this.ctx.strokeStyle = 'rgba(0,0,0,0.3)';
-      this.ctx.lineWidth   = 0.7;
-      this.ctx.fill();
-      this.ctx.stroke();
-      this.ctx.globalAlpha = prevAlpha;
-    });
-  }
-
-  // ── Draw robot (ladybug, top view) ───────────────────
-  drawRobot(robot) {
-    const ctx  = this.ctx;
-    const pos  = robot.pos.add(robot.vibrate);
-    const sp   = this._tmpV1;
-    this._w2sInto(pos, sp);
-    const R    = this.mToPx(CFG.ROBOT_RADIUS);
-    const h    = robot.heading;
-    const s    = this.scale;
-
-    ctx.save();
-    ctx.translate(sp.x, sp.y);
-    ctx.rotate(h);
-
-    // ── Shadow ──
-    ctx.save();
-    ctx.globalAlpha = 0.25;
-    ctx.beginPath();
-    ctx.ellipse(R * 0.08, R * 0.12, R * 1.05, R * 0.9, 0, 0, 2 * Math.PI);
-    ctx.fillStyle = '#000';
-    ctx.fill();
-    ctx.restore();
-
-    // ── Body (red ellipse) ──
-    ctx.beginPath();
-    ctx.ellipse(0, 0, R, R * 0.9, 0, 0, 2 * Math.PI);
-    // cache gradients per zoom
-    if (this._cachedZoom !== camera.zoom) {
-      this._cachedZoom = camera.zoom;
-      this._bodyGrad = ctx.createRadialGradient(-R * 0.25, -R * 0.3, 0, 0, 0, R * 1.1);
-      this._bodyGrad.addColorStop(0, '#ff5a3a');
-      this._bodyGrad.addColorStop(0.6, '#cc2200');
-      this._bodyGrad.addColorStop(1,   '#801400');
-      this._headGrad = ctx.createRadialGradient(R * 0.72, -R * 0.1, 0, R * 0.82, 0, R * 0.32);
-      this._headGrad.addColorStop(0, '#444');
-      this._headGrad.addColorStop(1, '#111');
+    } else {
+      world.hideLegs();
     }
-    ctx.fillStyle   = this._bodyGrad;
-    ctx.strokeStyle = '#601000';
-    ctx.lineWidth   = Math.max(1, R * 0.07);
-    ctx.fill();
-    ctx.stroke();
-
-    // ── Centre line (elytra seam) ──
-    ctx.beginPath();
-    ctx.moveTo(-R * 0.08, -R * 0.85);
-    ctx.lineTo(-R * 0.08,  R * 0.85);
-    ctx.strokeStyle = 'rgba(80,0,0,0.6)';
-    ctx.lineWidth   = Math.max(0.5, R * 0.04);
-    ctx.stroke();
-
-    // ── Black spots (4 on body) ──
-    const spotPositions = [
-      [-0.35, -0.40], [0.35, -0.40],
-      [-0.32,  0.22], [0.32,  0.22],
-    ];
-    spotPositions.forEach(([sx, sy]) => {
-      ctx.beginPath();
-      ctx.ellipse(sx * R, sy * R, R * 0.16, R * 0.14, 0, 0, 2 * Math.PI);
-      ctx.fillStyle = 'rgba(0,0,0,0.75)';
-      ctx.fill();
-    });
-
-    // ── Head (dark circle, front = +x direction in local space) ──
-    ctx.beginPath();
-    ctx.arc(R * 0.82, 0, R * 0.32, 0, 2 * Math.PI);
-    ctx.fillStyle   = this._headGrad;
-    ctx.strokeStyle = '#000';
-    ctx.lineWidth   = Math.max(0.5, R * 0.05);
-    ctx.fill();
-    ctx.stroke();
-
-    // Head eyes (two tiny white dots)
-    [[-0.1, -0.17], [-0.1, 0.17]].forEach(([ex, ey]) => {
-      ctx.beginPath();
-      ctx.arc((R * 0.82) + ex * R, ey * R, R * 0.05, 0, 2 * Math.PI);
-      ctx.fillStyle = 'rgba(255,255,255,0.9)';
-      ctx.fill();
-    });
-
-    // ── Antennae ──
-    ctx.strokeStyle = 'rgba(0,0,0,0.7)';
-    ctx.lineWidth   = Math.max(0.5, R * 0.04);
-    const antLen = R * 0.55;
-    [[-0.28], [0.28]].forEach(([ay]) => {
-      ctx.beginPath();
-      ctx.moveTo(R * 0.95, ay * R);
-      ctx.quadraticCurveTo(
-        R * 1.3,  ay * R - Math.sign(ay) * R * 0.15,
-        R * 1.35, ay * R - Math.sign(ay) * R * 0.35
-      );
-      ctx.stroke();
-      // Antenna tip ball
-      ctx.beginPath();
-      ctx.arc(R * 1.35, ay * R - Math.sign(ay) * R * 0.35, R * 0.06, 0, 2 * Math.PI);
-      ctx.fillStyle = '#2a2a2a';
-      ctx.fill();
-    });
-
-    // ── Transparent "belly window" showing eggs inside ──
-    ctx.beginPath();
-    ctx.ellipse(-R * 0.10, 0, R * 0.42, R * 0.30, 0, 0, 2 * Math.PI);
-    ctx.save();
-    ctx.clip();
-    // Inside tint
-    ctx.fillStyle = 'rgba(230, 255, 200, 0.18)';
-    ctx.fill();
-    // Draw mini-eggs inside window
-    const miniEggs = Math.min(
-      robot.clutches.reduce((a, c) => a + c.eggs.length, 0),
-      8
-    );
-    for (let i = 0; i < miniEggs; i++) {
-      const ea = (i / 8) * 2 * Math.PI;
-      const er = R * 0.22;
-      ctx.beginPath();
-      ctx.ellipse(
-        -R * 0.10 + Math.cos(ea) * er * 0.55,
-        Math.sin(ea) * er * 0.4,
-        R * 0.07, R * 0.055, ea, 0, 2 * Math.PI
-      );
-      ctx.fillStyle = `hsl(${90 + i * 15}, 55%, 55%)`;
-      ctx.globalAlpha = 0.75;
-      ctx.fill();
-    }
-    ctx.restore();
-    ctx.beginPath();
-    ctx.ellipse(-R * 0.10, 0, R * 0.42, R * 0.30, 0, 0, 2 * Math.PI);
-    ctx.strokeStyle = 'rgba(180,255,130,0.35)';
-    ctx.lineWidth   = Math.max(0.5, R * 0.04);
-    ctx.stroke();
-
-    // ── Wheels (2 driven wheels, visible from top) ──
-    const wheelW = R * 0.22;
-    const wheelH = R * 0.45;
-    [-1, 1].forEach(side => {
-      ctx.save();
-      ctx.translate(0, side * R * 0.88);
-      ctx.beginPath();
-      ctx.rect(-wheelH * 0.5, -wheelW * 0.5, wheelH, wheelW);
-      ctx.fillStyle   = '#222';
-      ctx.strokeStyle = '#555';
-      ctx.lineWidth   = Math.max(0.3, R * 0.03);
-      ctx.fill();
-      ctx.stroke();
-      ctx.restore();
-    });
-
-    // ── State indicator ring ──────────────────────────────
-    let stateColor = '#ffffff44';
-    switch (robot.state) {
-      case STATE.PATROL:     stateColor = '#6fcf9788'; break;
-      case STATE.ACQUIRE:    stateColor = '#4fc3f7aa'; break;
-      case STATE.SHOVE:      stateColor = '#ff6b6bee'; break;
-      case STATE.BLOCK:      stateColor = '#f5a623cc'; break;
-      case STATE.LINE_AVOID: stateColor = '#e8c84add'; break;
-      case STATE.PANIC:      stateColor = '#ff3b3bee'; break;
-      case STATE.RECOVER:    stateColor = '#a5d6a799'; break;
-    }
-    ctx.beginPath();
-    ctx.arc(0, 0, R * 1.08, 0, 2 * Math.PI);
-    ctx.strokeStyle = stateColor;
-    ctx.lineWidth   = Math.max(1, R * 0.09);
-    ctx.stroke();
-
-    // Buzz ripples
-    if (robot.isBuzzing) {
-      const buzzR = R * 1.4 + Math.sin(robot.buzzPhase) * R * 0.25;
-      ctx.beginPath();
-      ctx.arc(0, 0, buzzR, 0, 2 * Math.PI);
-      ctx.strokeStyle = 'rgba(200,170,255,0.35)';
-      ctx.lineWidth   = 1.5;
-      ctx.stroke();
-    }
-
-    ctx.restore();
-
-    // ── Ultrasonic sensor cone (debug visual) ──────────
-    if (s > 80) {
-      const rangeR = this.mToPx(Math.min(CFG.ULTRASONIC_RANGE, 3.0));
-      ctx.save();
-      ctx.translate(sp.x, sp.y);
-      ctx.rotate(h + (robot.servo ? robot.servo.angle : 0));
-      const halfFov = CFG.ULTRASONIC_FOV * 0.5;
-      ctx.beginPath();
-      ctx.moveTo(0, 0);
-      ctx.arc(0, 0, rangeR, -halfFov, halfFov);
-      ctx.closePath();
-      ctx.fillStyle = 'rgba(100,200,255,0.04)';
-      ctx.fill();
-      ctx.strokeStyle = 'rgba(100,200,255,0.10)';
-      ctx.lineWidth = 1;
-      ctx.stroke();
-      ctx.restore();
-    }
-  }
-
-  // ── Draw "legs" cursor ────────────────────────────────
-  drawLegs(legsPos) {
-    const sp  = this._tmpV1;
-    this._w2sInto(legsPos, sp);
-    const ctx = this.ctx;
-    const r   = this.mToPx(0.06);
-
-    // if legs are off-screen, skip detailed drawing
-    if (sp.x < -50 || sp.x > this.canvas.width + 50 ||
-        sp.y < -50 || sp.y > this.canvas.height + 50) return;
-
-    // Two foot silhouettes
-    const offsets = [
-      { dx: -r * 0.55, dy: r * 0.1, rot: -0.2 },
-      { dx:  r * 0.55, dy: r * 0.1, rot:  0.2 },
-    ];
-    offsets.forEach(o => {
-      ctx.save();
-      ctx.translate(sp.x + o.dx, sp.y + o.dy);
-      ctx.rotate(o.rot);
-      ctx.beginPath();
-      ctx.ellipse(0, 0, r * 0.55, r * 0.9, 0, 0, 2 * Math.PI);
-      ctx.fillStyle = 'rgba(255,220,180,0.85)';
-      ctx.strokeStyle = 'rgba(100,60,30,0.6)';
-      ctx.lineWidth = 1.5;
-      ctx.fill();
-      ctx.stroke();
-      // Toes
-      for (let t = 0; t < 4; t++) {
-        const ta = -0.5 + t * 0.33;
-        ctx.beginPath();
-        ctx.ellipse(Math.sin(ta) * r * 0.45, -r * 0.78, r * 0.13, r * 0.18, ta, 0, 2 * Math.PI);
-        ctx.fillStyle = 'rgba(255,210,160,0.85)';
-        ctx.strokeStyle = 'rgba(100,60,30,0.5)';
-        ctx.lineWidth = 1;
-        ctx.fill();
-        ctx.stroke();
-      }
-      ctx.restore();
-    });
-
-    // Ring to make position clear
-    ctx.save();
-    ctx.beginPath();
-    ctx.arc(sp.x, sp.y, r * 2.2, 0, 2 * Math.PI);
-    ctx.strokeStyle = 'rgba(255,255,255,0.2)';
-    ctx.lineWidth = 1;
-    ctx.stroke();
-    ctx.restore();
-  }
-
-  // ── Scale bar ─────────────────────────────────────────
-  drawScaleBar() {
-    const ctx = this.ctx;
-    const barM   = 1.0;  // 1 metre
-    const barPx  = this.mToPx(barM);
-    const bx     = 24;
-    const by     = this.canvas.height - 36;
-    ctx.save();
-    ctx.fillStyle   = 'rgba(10,10,20,0.6)';
-    ctx.strokeStyle = '#aaa';
-    ctx.lineWidth   = 2;
-    ctx.beginPath();
-    ctx.moveTo(bx, by);
-    ctx.lineTo(bx + barPx, by);
-    ctx.moveTo(bx, by - 6);
-    ctx.lineTo(bx, by + 6);
-    ctx.moveTo(bx + barPx, by - 6);
-    ctx.lineTo(bx + barPx, by + 6);
-    ctx.stroke();
-    ctx.fillStyle   = '#ddd';
-    ctx.font        = '12px Segoe UI,sans-serif';
-    ctx.textAlign   = 'center';
-    ctx.fillText('1 м', bx + barPx / 2, by - 10);
-    ctx.restore();
-  }
-
-  // ── Main draw ─────────────────────────────────────────
-  _renderStatic(obstacles) {
-    const zc = this._staticCanvas;
-    const needsResize = zc.width !== this.canvas.width || zc.height !== this.canvas.height;
-    if (needsResize) {
-      zc.width  = this.canvas.width;
-      zc.height = this.canvas.height;
-      this._staticSize.w = zc.width;
-      this._staticSize.h = zc.height;
-    }
-    if (needsResize || this._staticZoom !== camera.zoom) {
-      const ctx = zc.getContext('2d');
-      ctx.clearRect(0, 0, zc.width, zc.height);
-      // paint background fill first so zone ring still overlays it
-      ctx.fillStyle = '#16162a';
-      ctx.fillRect(0, 0, zc.width, zc.height);
-
-      const prevCtx = this.ctx;
-      this.ctx = ctx; // temporarily direct drawZone/Obstacles here
-      this.drawZone();
-      this.drawObstacles(obstacles);
-      this.ctx = prevCtx;
-
-      this._staticZoom = camera.zoom;
-    }
-  }
-
-  draw(robot, legsPos, obstacles) {
-    const ctx = this.ctx;
-
-    // first composite static layer
-    this._renderStatic(obstacles);
-    ctx.drawImage(this._staticCanvas, 0, 0);
-
-    this.drawClutches(robot.clutches, robot.activeClutchIdx);
-    this.drawParticles(robot.particles);
-    this.drawRobot(robot);
-    this.drawLegs(legsPos);
-    this.drawScaleBar();
-  }
-}
-
-// ── UI helpers ────────────────────────────────────────────────
-const elState   = document.getElementById('state-label');
-const elDist    = document.getElementById('dist-label');
-const elPercept = document.getElementById('percept-label');
-const elClutch  = document.getElementById('clutch-count-label');
-const elLayTmr  = document.getElementById('lay-timer-label');
-const elTimer   = document.getElementById('timer-label');
-const elSpeed   = document.getElementById('speed-value');
-const speedSldr = document.getElementById('speed-slider');
-
-function updateUI(robot, timeScale) {
-  const stateKey = robot.state.toLowerCase().replace('_', '-');
-  elState.textContent = STATE_LABELS[robot.state] || robot.state;
-  elState.className   = 'state-badge ' + stateKey.replace('idle-safe','safe').replace('laying','laying');
-
-  // show ultrasonic sensor reading instead of legs distance
-  const d = robot.ultrasonic.lastMeasurement;
-  elDist.textContent = isFinite(d) ? `${d.toFixed(2)} м` : '> 3 м';
-
-  const PERCEPT_LABELS = { empty: '— пусто', scanning: '🔍 сканирует', legs: '🦵 ноги!', wall: '🧱 стена' };
-  const PERCEPT_COLORS = { empty: '#888', scanning: '#f0c040', legs: '#f05050', wall: '#60c0ff' };
-  const pk = robot.percept || 'empty';
-  elPercept.textContent = PERCEPT_LABELS[pk] || pk;
-  elPercept.style.color = PERCEPT_COLORS[pk] || '#888';
-
-  const totalEggs = robot.clutches.reduce((a, c) => a + c.eggs.length, 0);
-  elClutch.textContent = `${robot.clutches.length} кл. (${totalEggs} икринок)`;
-
-  const safeRemain = CFG.SAFE_CYCLE_PERIOD / timeScale - robot.safeTimer / timeScale;
-  if (robot.state === STATE.IDLE_SAFE) {
-    elLayTmr.textContent = `${Math.max(0, (CFG.SAFE_CYCLE_PERIOD - robot.safeTimer) / timeScale).toFixed(0)} с`;
   } else {
-    elLayTmr.textContent = '—';
+    world.hideLegs();
   }
 
-  elTimer.textContent = `${robot.stateTimer.toFixed(1)} с`;
-  elSpeed.textContent = `${timeScale}×`;
+  // ── Simulation step (with speed slider + acceleration) ──
+  const accel = CFG.SIM_SPEED_ACCEL ?? 4.0;
+  const alpha = 1 - Math.exp(-accel * dtRaw);
+  simSpeed += (simSpeedTarget - simSpeed) * alpha;
+  simSpeed = Math.max(CFG.SIM_SPEED_MIN ?? 0.25, Math.min(CFG.SIM_SPEED_MAX ?? 3.0, simSpeed));
+
+  const simDt = dtRaw * simSpeed;
+  const maxStep = 0.02;
+  let remaining = simDt;
+  let sensors = robot.sensors;
+  while (remaining > 1e-8) {
+    const step = Math.min(remaining, maxStep);
+    world.update(step);
+    sensors = robot.readSensors(world);
+    firmware.update(step, sensors);
+    robot.update(step, world);
+    remaining -= step;
+  }
+
+  // ── Render ──
+  background(30, 30, 46);
+  render();
+
+  // ── UI ──
+  updatePanel(sensors);
+  drawCursor();
+
+  if (DEBUG) drawDebugOverlay();
 }
 
-// ── Main simulation loop ──────────────────────────────────────
-const canvas   = document.getElementById('canvas');
-const renderer = new Renderer(canvas);
-renderer.resize();
 
-// initial robot near zone centre, slightly offset
-const robot = new Robot(CFG.ZONE_CENTER_X - 0.3, CFG.ZONE_CENTER_Y + 0.2);
-const legsPos = new Vec2(-999, -999); // off-screen initially
+// ── Rendering ───────────────────────────────
 
-let lastTime  = null;
-let timeScale = 1;
+function render() {
+  // Floor (room interior)
+  const topLeft = worldToScreen(0, 0);
+  const botRight = worldToScreen(CFG.ROOM_W, CFG.ROOM_H);
+  fill(38, 38, 58);
+  noStroke();
+  rect(topLeft.x, topLeft.y, botRight.x - topLeft.x, botRight.y - topLeft.y);
 
-// Zoom
-canvas.addEventListener('wheel', e => {
-  e.preventDefault();
-  const delta = e.deltaY * CFG.ZOOM_STEP * -1;
-  camera.zoom = clamp(camera.zoom + delta * camera.zoom, CFG.ZOOM_MIN, CFG.ZOOM_MAX);
-}, { passive: false });
+  // Floor grid (subtle)
+  stroke(50, 50, 70, 80);
+  strokeWeight(1);
+  for (let x = 0; x <= CFG.ROOM_W; x++) {
+    const a = worldToScreen(x, 0);
+    const b = worldToScreen(x, CFG.ROOM_H);
+    line(a.x, a.y, b.x, b.y);
+  }
+  for (let y = 0; y <= CFG.ROOM_H; y++) {
+    const a = worldToScreen(0, y);
+    const b = worldToScreen(CFG.ROOM_W, y);
+    line(a.x, a.y, b.x, b.y);
+  }
 
-// Mouse → legs position
-canvas.addEventListener('mousemove', e => {
-  const rect  = canvas.getBoundingClientRect();
-  const sx    = (e.clientX - rect.left) * (canvas.width  / rect.width);
-  const sy    = (e.clientY - rect.top)  * (canvas.height / rect.height);
-  const world = screenToWorld(sx, sy, canvas);
-  legsPos.x   = world.x;
-  legsPos.y   = world.y;
-});
+  // Room walls
+  stroke(180, 180, 200);
+  strokeWeight(3);
+  noFill();
+  rect(topLeft.x, topLeft.y, botRight.x - topLeft.x, botRight.y - topLeft.y);
 
-// Touch support (tablets)
-canvas.addEventListener('touchmove', e => {
-  e.preventDefault();
-  const touch = e.touches[0];
-  const rect  = canvas.getBoundingClientRect();
-  const sx    = (touch.clientX - rect.left) * (canvas.width  / rect.width);
-  const sy    = (touch.clientY - rect.top)  * (canvas.height / rect.height);
-  const world = screenToWorld(sx, sy, canvas);
-  legsPos.x   = world.x;
-  legsPos.y   = world.y;
-}, { passive: false });
+  // Room dimensions label
+  noStroke();
+  fill(120, 120, 150);
+  textSize(12);
+  textAlign(CENTER, TOP);
+  const mid = worldToScreen(CFG.ROOM_W / 2, 0);
+  text(`${CFG.ROOM_W} m × ${CFG.ROOM_H} m`, mid.x, mid.y - 18);
 
-speedSldr.addEventListener('input', () => {
-  timeScale = parseInt(speedSldr.value, 10);
-});
+  // Deposited eggs on floor
+  drawEggsOnFloor();
 
-window.addEventListener('resize', () => { renderer.resize(); });
+  // Placed obstacles / props
+  drawProps();
 
-function loop(ts) {
-  if (!lastTime) lastTime = ts;
-  let realDt = Math.min((ts - lastTime) / 1000, 0.05); // cap at 50 ms
-  lastTime   = ts;
-  const simDt = realDt * timeScale;
+  // Sensor rays
+  drawSensorRays();
 
-  robot.update(simDt, legsPos, OBSTACLES);
+  // Throw animations
+  drawThrowAnimations();
 
-  // keep camera roughly centred on robot (smooth follow)
-  camera.x += (robot.pos.x - camera.x) * 0.08;
-  camera.y += (robot.pos.y - camera.y) * 0.08;
+  // Visitor legs
+  drawLegs();
 
-  renderer.draw(robot, legsPos, OBSTACLES);
-  updateUI(robot, timeScale);
+  // Robot (ladybug)
+  drawRobot();
 
-  requestAnimationFrame(loop);
+  // Scale bar
+  drawScaleBar();
 }
 
-requestAnimationFrame(loop);
+function drawEggsOnFloor() {
+  for (const egg of robot.eggs) {
+    const p = worldToScreen(egg.x, egg.y);
+    // Outer glow
+    noStroke();
+    fill(120, 200, 100, 60);
+    ellipse(p.x, p.y, 18, 18);
+    fill(160, 230, 120);
+    ellipse(p.x, p.y, 10, 10);
+    // Sheen
+    fill(220, 255, 200, 180);
+    ellipse(p.x - 2, p.y - 2, 4, 4);
+  }
+}
+
+function drawSensorRays() {
+  const angles = CFG.TOF_ANGLES;
+  const keys   = ['front', 'left', 'right'];
+  const colors = [
+    [80, 180, 255],
+    [80, 255, 180],
+    [255, 180, 80],
+  ];
+
+  for (let i = 0; i < 3; i++) {
+    const mm = robot.sensors[keys[i]];
+    if (mm === null) continue;
+
+    const angle  = robot.heading + angles[i];
+    const dist   = mm / 1000;
+    const ox     = robot.x;
+    const oy     = robot.y;
+    const hx     = ox + Math.cos(angle) * dist;
+    const hy     = oy + Math.sin(angle) * dist;
+
+    const pA = worldToScreen(ox, oy);
+    const pH = worldToScreen(hx, hy);
+
+    // Ray line (dim)
+    stroke(colors[i][0], colors[i][1], colors[i][2], 70);
+    strokeWeight(1.5);
+    line(pA.x, pA.y, pH.x, pH.y);
+
+    // Hit dot (bright)
+    noStroke();
+    fill(colors[i][0], colors[i][1], colors[i][2], 220);
+    ellipse(pH.x, pH.y, 6, 6);
+
+    // Distance label (small)
+    fill(colors[i][0], colors[i][1], colors[i][2], 160);
+    textSize(10);
+    textAlign(LEFT);
+    text(`${mm}mm`, pH.x + 5, pH.y + 3);
+  }
+}
+
+function drawThrowAnimations() {
+  for (const ev of robot.throwEvents) {
+    const t = ev.age / ev.duration;          // 0 → 1
+    // Parabolic arc
+    const ix = lerp(ev.fromX, ev.toX, t);
+    const iy = lerp(ev.fromY, ev.toY, t);
+    // Arc height in screen pixels converted to world offset
+    const arcHeight = 0.3 * Math.sin(Math.PI * t);  // metres
+
+    // Perpendicular to direction
+    const dx = ev.toX - ev.fromX;
+    const dy = ev.toY - ev.fromY;
+    const len = Math.sqrt(dx * dx + dy * dy) + 1e-6;
+    const px = -dy / len;
+    const py =  dx / len;
+
+    const wx = ix + px * arcHeight;
+    const wy = iy + py * arcHeight;
+
+    const p = worldToScreen(wx, wy);
+    const alpha = (1 - t) * 255;
+
+    noStroke();
+    fill(180, 255, 100, alpha);
+    const sz = (1 - t * 0.5) * 10;
+    ellipse(p.x, p.y, sz, sz);
+  }
+}
+
+function drawLegs() {
+  // Draw cursor legs (if visible)
+  if (world.legsVisible) {
+    for (const leg of world.legCentres) {
+      drawLegCircle(leg.x, leg.y, false);
+    }
+  }
+
+  // Draw pinned legs
+  for (const leg of world.pinnedLegs) {
+    drawLegCircle(leg.x, leg.y, true);
+  }
+}
+
+function drawProps() {
+  drawPedestals();
+  drawBags();
+}
+
+function drawBags() {
+  for (const bag of world.bags) {
+    if (bag.hidden) continue;
+    const p = worldToScreen(bag.x, bag.y);
+    const r = CFG.BAG_RADIUS * ppm;
+
+    // Shadow
+    noStroke();
+    fill(0, 0, 0, 55);
+    ellipse(p.x + 4, p.y + 5, r * 2.0, r * 1.6);
+
+    // Bag body
+    stroke(30, 40, 55, 180);
+    strokeWeight(2);
+    fill(35, 55, 70, 220);
+    ellipse(p.x, p.y, r * 2.0, r * 1.6);
+
+    // Strap / highlight
+    noStroke();
+    fill(210, 230, 255, 90);
+    ellipse(p.x - r * 0.25, p.y - r * 0.15, r * 0.8, r * 0.5);
+
+    stroke(170, 190, 220, 140);
+    strokeWeight(1.5);
+    noFill();
+    arc(p.x, p.y - r * 0.15, r * 1.2, r * 0.9, Math.PI * 1.1, Math.PI * 1.9);
+  }
+}
+
+function drawPedestals() {
+  for (const ped of world.pedestals) {
+    const p = worldToScreen(ped.x, ped.y);
+    const r = CFG.PEDESTAL_RADIUS * ppm;
+
+    // Shadow
+    noStroke();
+    fill(0, 0, 0, 60);
+    ellipse(p.x + 6, p.y + 8, r * 2.02, r * 2.02);
+
+    // Base
+    stroke(180, 185, 200, 220);
+    strokeWeight(3);
+    fill(120, 125, 140, 180);
+    ellipse(p.x, p.y, r * 2, r * 2);
+
+    // Top highlight
+    noStroke();
+    fill(220, 225, 240, 90);
+    ellipse(p.x - r * 0.18, p.y - r * 0.20, r * 1.0, r * 1.0);
+
+    // Rim
+    stroke(230, 235, 250, 160);
+    strokeWeight(1.5);
+    noFill();
+    ellipse(p.x, p.y, r * 1.65, r * 1.65);
+  }
+}
+
+function drawLegCircle(wx, wy, isPinned) {
+  const p = worldToScreen(wx, wy);
+  const r = CFG.LEG_RADIUS * ppm;
+
+  // Shadow
+  noStroke();
+  fill(0, 0, 0, 60);
+  ellipse(p.x + 3, p.y + 3, r * 2 + 4, r * 2 + 4);
+
+  if (isPinned) {
+    // Pinned leg: stronger outline, different color
+    stroke(255, 200, 80);  // golden outline
+    strokeWeight(3);
+    fill(180, 120, 40);     // darker/warmer brown
+    ellipse(p.x, p.y, r * 2, r * 2);
+
+    // Shoe highlight
+    noStroke();
+    fill(255, 220, 120, 180);
+    ellipse(p.x - r * 0.25, p.y - r * 0.25, r * 0.8, r * 0.6);
+
+    // Indicator that this leg is pinned (small cross or mark)
+    stroke(255, 200, 80, 220);
+    strokeWeight(1.5);
+    line(p.x - r * 0.3, p.y, p.x + r * 0.3, p.y);
+    line(p.x, p.y - r * 0.3, p.x, p.y + r * 0.3);
+  } else {
+    // Cursor leg: regular appearance
+    stroke(200, 180, 140);
+    strokeWeight(2);
+    fill(140, 110, 80);
+    ellipse(p.x, p.y, r * 2, r * 2);
+
+    // Shoe highlight
+    noStroke();
+    fill(200, 170, 120, 140);
+    ellipse(p.x - r * 0.25, p.y - r * 0.25, r * 0.8, r * 0.6);
+  }
+}
+
+function drawRobot() {
+  const p = worldToScreen(robot.x, robot.y);
+  const r = CFG.ROBOT_RADIUS * ppm;
+
+  push();
+  translate(p.x, p.y);
+  rotate(robot.heading);
+
+  // ── Body shadow ──
+  noStroke();
+  fill(0, 0, 0, 60);
+  ellipse(3, 4, r * 2 + 4, r * 2 + 4);
+
+  // ── Wing cases (elytra) ──
+  const bodyColor = stateBodyColor();
+  fill(...bodyColor);
+  stroke(20, 10, 10, 180);
+  strokeWeight(1.5);
+  // Left elytron
+  arc(0, 0, r * 2, r * 2, Math.PI * 0.1, Math.PI * 1.0);
+  // Right elytron
+  arc(0, 0, r * 2, r * 2, Math.PI * 1.0, Math.PI * 2.0 - 0.1);
+  // Centre seam line
+  stroke(20, 10, 10, 200);
+  strokeWeight(1);
+  line(r * 0.15, -r * 0.85, r * 0.15, r * 0.9);
+  line(-r * 0.15, -r * 0.85, -r * 0.15, r * 0.9);
+
+  // ── Head ──
+  noStroke();
+  fill(30, 20, 20);
+  ellipse(r * 0.7, 0, r * 0.6, r * 0.5);
+
+  // ── Eyes ──
+  fill(255, 255, 200);
+  ellipse(r * 0.85, -r * 0.15, r * 0.15, r * 0.15);
+  ellipse(r * 0.85,  r * 0.15, r * 0.15, r * 0.15);
+  fill(20, 20, 20);
+  ellipse(r * 0.90, -r * 0.14, r * 0.08, r * 0.08);
+  ellipse(r * 0.90,  r * 0.14, r * 0.08, r * 0.08);
+
+  // ── Black spots on elytra ──
+  fill(20, 15, 15, 220);
+  noStroke();
+  const spots = [
+    [ 0.15, -0.55, 0.28],
+    [ 0.15,  0.55, 0.28],
+    [ 0.15, -0.2,  0.22],
+    [ 0.15,  0.2,  0.22],
+    [-0.35, -0.45, 0.24],
+    [-0.35,  0.45, 0.24],
+  ];
+  for (const [sx, sy, sr] of spots) {
+    ellipse(sx * r, sy * r, sr * r * 2, sr * r * 2);
+  }
+
+  // ── Transparent window: show carried eggs ──
+  if (robot.eggsCarried > 0) {
+    noStroke();
+    fill(255, 255, 255, 25);
+    ellipse(-0.15 * r, 0, r * 1.1, r * 1.0);
+
+    // Egg cluster inside body
+    const eggPositions = [
+      [-0.05, -0.3], [-0.05, 0], [-0.05, 0.3],
+      [-0.35, -0.15], [-0.35, 0.15],
+      [-0.60, 0],
+    ];
+    for (let i = 0; i < robot.eggsCarried && i < eggPositions.length; i++) {
+      const [ex, ey] = eggPositions[i];
+      fill(160, 230, 120, 200);
+      ellipse(ex * r, ey * r, r * 0.22, r * 0.22);
+      fill(220, 255, 200, 150);
+      ellipse(ex * r - r * 0.04, ey * r - r * 0.04, r * 0.07, r * 0.07);
+    }
+  }
+
+  // ── Sensor direction indicator (small arrow on head) ──
+  stroke(255, 255, 255, 80);
+  strokeWeight(1);
+  line(r * 0.6, 0, r * 1.1, 0);
+
+  pop();
+}
+
+function stateBodyColor() {
+  switch (firmware.state) {
+    case STATE.WANDER:          return [200,  40,  35];
+    case STATE.SCAN_CLUSTER:    return [230, 120,  30];
+    case STATE.VERIFY_NOT_WALL: return [ 80, 180, 220];
+    case STATE.APPROACH:        return [230, 200,  20];
+    case STATE.DEPOSIT:         return [160,  60, 220];
+    case STATE.ESCAPE:          return [230,  60,  60];
+    default:                    return [200,  40,  35];
+  }
+}
+
+function drawScaleBar() {
+  // 1 m bar
+  const barWorldLen = 1; // metres
+  const barPixLen   = barWorldLen * ppm;
+  const bx = 20, by = height - 28;
+
+  stroke(200);
+  strokeWeight(1.5);
+  line(bx, by, bx + barPixLen, by);
+  line(bx, by - 4, bx, by + 4);
+  line(bx + barPixLen, by - 4, bx + barPixLen, by + 4);
+
+  noStroke();
+  fill(200);
+  textSize(11);
+  textAlign(CENTER, BOTTOM);
+  text('1 m', bx + barPixLen / 2, by - 6);
+}
+
+function drawCursor() {
+  // Crosshair only
+  const mx = mouseX, my = mouseY;
+  const col =
+    activeTool === TOOL.LEGS ? [255, 200, 80, 140] :
+    activeTool === TOOL.BAGS ? [140, 200, 255, 140] :
+    activeTool === TOOL.PEDESTALS ? [220, 220, 255, 140] :
+    [255, 255, 255, 120];
+  stroke(...col);
+  strokeWeight(1);
+  line(mx - 12, my, mx + 12, my);
+  line(mx, my - 12, mx, my + 12);
+}
+
+// ── Debug overlay ───────────────────────────
+
+function drawDebugOverlay() {
+  push();
+  translate(10, height - 10);
+  textSize(11);
+  textAlign(LEFT, BOTTOM);
+  noStroke();
+  fill(255, 255, 255, 180);
+  for (let i = debugLog.length - 1; i >= 0; i--) {
+    text(debugLog[i], 0, -12 * (debugLog.length - 1 - i));
+  }
+  pop();
+}
+
+// ── Coordinate transforms ────────────────────
+
+function worldToScreen(wx, wy) {
+  return {
+    x: (wx - camX) * ppm + width  / 2,
+    y: (wy - camY) * ppm + height / 2,
+  };
+}
+
+function screenToWorld(sx, sy) {
+  return {
+    x: (sx - width  / 2) / ppm + camX,
+    y: (sy - height / 2) / ppm + camY,
+  };
+}
+
+function isUiEvent(e) {
+  const t = e?.target;
+  if (!t || typeof t.closest !== 'function') return false;
+  return !!t.closest('#state-panel');
+}
+
+// ── Input handlers ──────────────────────────
+
+function mousePressed(e) {
+  if (isUiEvent(e)) return;
+  // Middle-button or right-button → pan
+  if (mouseButton === CENTER || mouseButton === RIGHT) {
+    isPanning   = true;
+    panStartX   = mouseX;
+    panStartY   = mouseY;
+    panCamX0    = camX;
+    panCamY0    = camY;
+    return false;
+  }
+
+  // Left-button → tool action
+  if (mouseButton === LEFT) {
+    const insideRoom =
+      mouseWorldX >= 0 && mouseWorldX <= CFG.ROOM_W &&
+      mouseWorldY >= 0 && mouseWorldY <= CFG.ROOM_H;
+
+    if (activeTool === TOOL.LEGS) {
+      if (insideRoom) {
+        world.addPinnedLegPair(mouseWorldX, mouseWorldY);
+        dbg(`placed legs at (${mouseWorldX.toFixed(2)}, ${mouseWorldY.toFixed(2)})`);
+      }
+    } else if (activeTool === TOOL.BAGS) {
+      if (insideRoom) {
+        world.addBag(mouseWorldX, mouseWorldY);
+        dbg(`placed bag at (${mouseWorldX.toFixed(2)}, ${mouseWorldY.toFixed(2)})`);
+      }
+    } else if (activeTool === TOOL.PEDESTALS) {
+      world.addPedestal(mouseWorldX, mouseWorldY);
+      dbg(`placed pedestal at (${mouseWorldX.toFixed(2)}, ${mouseWorldY.toFixed(2)})`);
+    }
+    return false;
+  }
+}
+
+function mouseReleased(e) {
+  if (isUiEvent(e)) return;
+  isPanning = false;
+}
+
+function keyPressed() {
+  if (keyCode === ESCAPE) {
+    setTool(TOOL.CURSOR);
+    return false;
+  }
+}
+
+function mouseDragged() {
+  if (isPanning) {
+    camX = panCamX0 - (mouseX - panStartX) / ppm;
+    camY = panCamY0 - (mouseY - panStartY) / ppm;
+  }
+}
+
+// Must be attached as passive:false to prevent default scroll behaviour
+function onWheel(e) {
+  e.preventDefault();
+  const factor = e.deltaY < 0 ? 1.1 : 0.9;
+  // Zoom toward mouse position
+  const mw = screenToWorld(mouseX, mouseY);
+  ppm *= factor;
+  ppm = constrain(ppm, 5, 300);
+  // Re-anchor so that mouse world point stays under cursor
+  const mwAfter = screenToWorld(mouseX, mouseY);
+  camX += mw.x - mwAfter.x;
+  camY += mw.y - mwAfter.y;
+}
+
+function windowResized() {
+  resizeCanvas(windowWidth, windowHeight);
+}
+
+// ── State panel DOM update ───────────────────
+
+function updatePanel(sensors) {
+  const stateEl = document.getElementById('state-badge');
+  const fmtMM   = v => v === null ? '— mm' : `${v} mm`;
+
+  if (stateEl) {
+    const s = firmware.state;
+    stateEl.textContent  = s;
+    stateEl.className    = 'badge ' + s.toLowerCase().replace(/_/g, '-');
+  }
+
+  const setCell = (id, val) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = val;
+  };
+
+  setCell('sensor-front',  fmtMM(sensors.front));
+  setCell('sensor-left',   fmtMM(sensors.left));
+  setCell('sensor-right',  fmtMM(sensors.right));
+  setCell('eggs-carried',  robot.eggsCarried);
+  setCell('eggs-deposited', robot.eggs.length);
+  setCell('sim-speed',     `${simSpeed.toFixed(2)}×`);
+  setCell('zoom-level',    `${Math.round(ppm)} px/m`);
+}

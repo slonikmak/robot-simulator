@@ -5,11 +5,9 @@
 - `index.html`: entry page; hosts the `<canvas>` and loads scripts.
 - `styles.css`: UI styling for the state panel and canvas.
 - `main.js`: simulation loop, rendering, input (mouse “legs”), and constants (`CFG`).
-- `robot.js`: physics + sensor models (ultrasonic, color sensor) and egg/clutch visuals.
+- `robot.js`: physics + sensor models (ToF).
 - `firmware.js`: Arduino-style state machine and behavior transitions (keep this logic portable).
-- `spec.md`: behavior/spec notes; track requirements as `R-XXX`.
-- `tasks/T-*.md`: plan files used by the workflow (Plan Gate).
-- `docs/agents/*`: agent workflow and skill docs.
+- `spec.md`: behavior/spec notes.
 
 ## Build, Test, and Development Commands
 

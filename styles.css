@@ -13,114 +13,221 @@ html, body {
   color: #e0e0e0;
 }
 
-#canvas {
-  display: block;
-  width: 100%;
-  height: 100%;
+/* p5.js injects a <canvas> into #canvas-wrapper */
+#canvas-wrapper {
+  position: fixed;
+  inset: 0;
   cursor: none;
+  z-index: 0;
 }
 
-/* UI Panel */
-#ui {
+#canvas-wrapper canvas {
+  display: block;
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+}
+
+/* ── State panel ────────────────────────────────── */
+#state-panel {
   position: fixed;
   top: 16px;
   right: 16px;
-  pointer-events: none;
-  z-index: 10;
-}
-
-#state-panel {
-  background: rgba(10, 10, 30, 0.82);
+  background: rgba(10, 10, 30, 0.88);
   border: 1px solid rgba(100, 150, 255, 0.25);
   border-radius: 12px;
   padding: 14px 16px;
-  width: 240px;
-  backdrop-filter: blur(8px);
+  width: 220px;
+  backdrop-filter: blur(10px);
+  z-index: 50;
+  box-shadow: 0 4px 28px rgba(0, 0, 0, 0.55);
   pointer-events: auto;
-  box-shadow: 0 4px 24px rgba(0,0,0,0.5);
+  user-select: none;
 }
 
 .panel-title {
-  font-size: 1rem;
+  font-size: 0.85rem;
   font-weight: 700;
   margin-bottom: 10px;
   color: #a0c4ff;
-  letter-spacing: 0.02em;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
 }
 
-.info-row {
+.panel-section-title {
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: #606080;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin: 10px 0 5px;
+  border-top: 1px solid rgba(255,255,255,0.06);
+  padding-top: 8px;
+}
+
+.panel-row {
   display: flex;
   justify-content: space-between;
   align-items: center;
   font-size: 0.78rem;
-  margin-bottom: 5px;
+  margin-bottom: 4px;
   gap: 6px;
 }
 
-.info-key {
-  color: #888;
+.tool-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.tool-actions {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.tool-btn {
+  pointer-events: auto;
+  appearance: none;
+  border: 1px solid rgba(160, 196, 255, 0.22);
+  background: rgba(20, 20, 45, 0.75);
+  color: #c8d6ff;
+  border-radius: 10px;
+  padding: 6px 8px;
+  font-size: 0.72rem;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, transform 0.05s;
+}
+
+.tool-btn:hover {
+  background: rgba(28, 28, 60, 0.85);
+  border-color: rgba(160, 196, 255, 0.35);
+}
+
+.tool-btn:active {
+  transform: translateY(1px);
+}
+
+.tool-btn.is-active {
+  background: rgba(60, 90, 160, 0.35);
+  border-color: rgba(160, 196, 255, 0.55);
+  color: #e8f0ff;
+}
+
+.tool-btn.tool-clear {
+  flex: 1;
+  background: rgba(70, 30, 40, 0.55);
+  border-color: rgba(255, 160, 190, 0.25);
+  color: #ffd2df;
+}
+
+.tool-btn.tool-clear:hover {
+  background: rgba(90, 35, 50, 0.65);
+  border-color: rgba(255, 160, 190, 0.35);
+}
+
+.toggle {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 10px;
+  border: 1px solid rgba(160, 196, 255, 0.16);
+  background: rgba(18, 18, 40, 0.55);
+  margin-bottom: 8px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.toggle:hover {
+  border-color: rgba(160, 196, 255, 0.28);
+  background: rgba(22, 22, 50, 0.62);
+}
+
+.toggle input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: #a0c4ff;
+}
+
+.toggle-label {
+  font-size: 0.72rem;
+  font-weight: 650;
+  color: #d6e2ff;
+  letter-spacing: 0.02em;
+}
+
+.panel-label {
+  color: #808090;
   white-space: nowrap;
   flex-shrink: 0;
 }
 
-.state-badge {
-  display: inline-block;
-  padding: 2px 7px;
-  border-radius: 20px;
-  font-size: 0.72rem;
-  font-weight: 600;
-  background: rgba(255,255,255,0.08);
-  color: #fff;
-  text-align: right;
-  transition: background 0.3s;
-}
-
-.state-badge.sleep      { background: #2c3e50; color: #7fb3d3; }
-.state-badge.safe       { background: #1e4d2b; color: #6fcf97; }
-.state-badge.laying     { background: #4a2c6a; color: #c19fff; }
-.state-badge.aggression { background: #5a1a1a; color: #ff6b6b; }
-.state-badge.retreat    { background: #3a2a10; color: #f5a623; }
-.state-badge.guard      { background: #1a3a4a; color: #4fc3f7; }
-.state-badge.calming    { background: #2a3a20; color: #a5d6a7; }
-
-/* New FSM (territory + shove) */
-.state-badge.patrol     { background: #1e4d2b; color: #6fcf97; }
-.state-badge.acquire    { background: #1a3a4a; color: #4fc3f7; }
-.state-badge.shove      { background: #5a1a1a; color: #ff6b6b; }
-.state-badge.block      { background: #3a2a10; color: #f5a623; }
-.state-badge.line-avoid { background: #4a400f; color: #e8c84a; }
-.state-badge.panic      { background: #3b1212; color: #ff6b6b; }
-.state-badge.recover    { background: #2a3a20; color: #a5d6a7; }
-
-.divider {
-  border-top: 1px solid rgba(255,255,255,0.08);
-  margin: 10px 0;
-}
-
-.control-row {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
+.panel-value {
+  color: #d0d8f0;
+  font-variant-numeric: tabular-nums;
   font-size: 0.78rem;
 }
 
-.control-label {
-  color: #aaa;
+/* ── FSM state badge ──────────────────────────────── */
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 20px;
+  font-size: 0.70rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  transition: background 0.25s, color 0.25s;
 }
 
+.badge.wander           { background: #1b3d1f; color: #6fcf97; }
+.badge.scan-cluster     { background: #1a3a40; color: #50e3c2; }
+.badge.verify-not-wall  { background: #183050; color: #64b5f6; }
+.badge.approach         { background: #3d2e00; color: #ffc107; }
+.badge.deposit          { background: #2e1250; color: #ce93d8; }
+.badge.escape           { background: #4a1010; color: #ef5350; }
+
+/* ── Sensor table ──────────────────────────────────── */
+.sensor-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.76rem;
+}
+
+.sensor-table td {
+  padding: 2px 0;
+}
+
+.sensor-name {
+  font-weight: 600;
+  width: 60%;
+}
+
+.sensor-val {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: #c0d0f0;
+}
+
+/* ── Hint text ────────────────────────────────────── */
+.panel-hint {
+  font-size: 0.68rem;
+  color: #505060;
+  line-height: 1.7;
+  margin-top: 10px;
+  border-top: 1px solid rgba(255,255,255,0.06);
+  padding-top: 8px;
+}
+
+/* ── Speed slider (kept for compatibility) ─────────── */
 #speed-slider {
   width: 100%;
   accent-color: #a0c4ff;
-  cursor: pointer;
   pointer-events: auto;
-}
-
-.hint {
-  font-size: 0.72rem;
-  color: #666;
-  line-height: 1.6;
-}
-
-.hint b {
-  color: #888;
+  cursor: pointer;
 }

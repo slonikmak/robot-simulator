@@ -3,65 +3,90 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Симулятор выставочного робота</title>
+  <title>Exhibition Robot Simulator</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-  <canvas id="canvas"></canvas>
 
-  <script src="config.js"></script>
-  <script src="firmware.js"></script>
-  <script src="robot.js"></script>
+  <!-- p5.js canvas is injected into this wrapper -->
+  <div id="canvas-wrapper"></div>
 
-  <div id="ui">
-    <div id="state-panel">
-      <div class="panel-title">🐞 Робот на выставке</div>
+  <!-- Status panel (top-right) -->
+  <div id="state-panel">
+    <div class="panel-title">Robot Status</div>
 
-      <div class="info-row">
-        <span class="info-key">Состояние:</span>
-        <span id="state-label" class="state-badge">—</span>
-      </div>
-      <div class="info-row">
-        <span class="info-key">Дальность ультразвука:</span>
-        <span id="dist-label">—</span>
-      </div>
-      <div class="info-row">
-        <span class="info-key">Робот видит:</span>
-        <span id="percept-label">—</span>
-      </div>
-      <div class="info-row">
-        <span class="info-key">Кладок всего:</span>
-        <span id="clutch-count-label">0</span>
-      </div>
-      <div class="info-row">
-        <span class="info-key">Следующая кладка:</span>
-        <span id="lay-timer-label">—</span>
-      </div>
-      <div class="info-row">
-        <span class="info-key">Таймер состояния:</span>
-        <span id="timer-label">—</span>
-      </div>
+    <div class="panel-section-title">Инструменты</div>
+    <div class="tool-grid" id="tool-grid">
+      <button type="button" class="tool-btn is-active" data-tool="cursor">Курсор</button>
+      <button type="button" class="tool-btn" data-tool="legs">Ноги</button>
+      <button type="button" class="tool-btn" data-tool="bags">Сумки</button>
+      <button type="button" class="tool-btn" data-tool="pedestals">Тумбы</button>
+    </div>
+    <div class="tool-actions">
+      <button type="button" class="tool-btn tool-clear" id="tool-clear">Очистить</button>
+    </div>
+    <label class="toggle">
+      <input type="checkbox" id="toggle-alive" />
+      <span class="toggle-label">Оживить ноги/сумки</span>
+    </label>
 
-      <div class="divider"></div>
+    <div class="panel-row">
+      <span class="panel-label">State</span>
+      <span id="state-badge" class="badge wander">WANDER</span>
+    </div>
 
-      <div class="control-row">
-        <label for="speed-slider" class="control-label">
-          Скорость симуляции:&nbsp;<strong id="speed-value">1×</strong>
-        </label>
-        <input type="range" id="speed-slider" min="1" max="60" value="1" step="1" />
-      </div>
+    <div class="panel-section-title">ToF Sensors</div>
+    <table class="sensor-table">
+      <tr>
+        <td class="sensor-name" style="color:#50b4ff">▶ Front</td>
+        <td id="sensor-front" class="sensor-val">— mm</td>
+      </tr>
+      <tr>
+        <td class="sensor-name" style="color:#50ffb4">◀ Left</td>
+        <td id="sensor-left" class="sensor-val">— mm</td>
+      </tr>
+      <tr>
+        <td class="sensor-name" style="color:#ffb450">▶ Right</td>
+        <td id="sensor-right" class="sensor-val">— mm</td>
+      </tr>
+    </table>
 
-      <div class="divider"></div>
+    <div class="panel-section-title">Eggs</div>
+    <div class="panel-row">
+      <span class="panel-label">Carrying</span>
+      <span id="eggs-carried" class="panel-value">8</span>
+    </div>
+    <div class="panel-row">
+      <span class="panel-label">Deposited</span>
+      <span id="eggs-deposited" class="panel-value">0</span>
+    </div>
 
-      <div class="hint">
-        <b>Управление</b><br/>
-        🖱 Курсор = ноги посетителя<br/>
-        🔄 Колёсико = зум<br/>
-        ⚡ Слайдер = ускорение времени
-      </div>
+    <div class="panel-section-title">View</div>
+    <div class="panel-row">
+      <span class="panel-label">Ускорение</span>
+      <span id="sim-speed" class="panel-value">1.00×</span>
+    </div>
+    <input id="speed-slider" type="range" min="0.25" max="3" step="0.05" value="1" />
+    <div class="panel-row">
+      <span class="panel-label">Zoom</span>
+      <span id="zoom-level" class="panel-value">— px/m</span>
+    </div>
+
+    <div class="panel-hint">
+      Scroll — zoom<br>
+      Right-drag — pan<br>
+      Курсор — динамические ноги<br>
+      Ноги/Сумки/Тумбы — ЛКМ поставить<br>
+      Esc — вернуться к курсору
     </div>
   </div>
 
+  <!-- ── Scripts (order matters: world → robot → firmware → main) ── -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js"></script>
+  <script src="world.js"></script>
+  <script src="robot.js"></script>
+  <script src="firmware.js"></script>
   <script src="main.js"></script>
+
 </body>
 </html>
