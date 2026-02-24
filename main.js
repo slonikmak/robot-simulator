@@ -43,6 +43,11 @@ function setTool(tool) {
   for (const b of btns) {
     b.classList.toggle('is-active', b.dataset.tool === tool);
   }
+
+  // On mobile: close the panel automatically when a placement tool is chosen
+  if (window.innerWidth <= 768) {
+    document.getElementById('state-panel').classList.remove('is-open');
+  }
 }
 
 function initToolsUI() {
@@ -97,6 +102,9 @@ let touchPanActive = false;
 let touchPanStartX, touchPanStartY, touchPanCamX0, touchPanCamY0;
 let pinchStartDist = 0, pinchStartPpm = 0;
 let pinchMidX = 0, pinchMidY = 0, pinchCamX0 = 0, pinchCamY0 = 0;
+// Last known touch position on screen (for crosshair & placement)
+let touchScrX = -9999, touchScrY = -9999;
+let touchTapStartX = 0, touchTapStartY = 0, touchTapMoved = false;
 
 // Mouse world position
 let mouseWorldX = 0;
@@ -567,8 +575,11 @@ function drawScaleBar() {
 }
 
 function drawCursor() {
-  // Crosshair only
-  const mx = mouseX, my = mouseY;
+  // On mobile, draw crosshair at last touch position (not mouseX/mouseY which is always 0)
+  const isMobile = window.innerWidth <= 768;
+  const mx = isMobile ? touchScrX : mouseX;
+  const my = isMobile ? touchScrY : mouseY;
+  if (mx < 0 || my < 0) return; // no touch yet
   const col =
     activeTool === TOOL.LEGS ? [255, 200, 80, 140] :
     activeTool === TOOL.BAGS ? [140, 200, 255, 140] :
@@ -716,13 +727,22 @@ function clampCamera() {
 function onTouchStart(e) {
   e.preventDefault();
   if (e.touches.length === 1) {
+    const cx        = e.touches[0].clientX;
+    const cy        = e.touches[0].clientY;
     touchPanActive  = true;
-    touchPanStartX  = e.touches[0].clientX;
-    touchPanStartY  = e.touches[0].clientY;
+    touchPanStartX  = cx;
+    touchPanStartY  = cy;
     touchPanCamX0   = camX;
     touchPanCamY0   = camY;
+    // Record tap start
+    touchScrX       = cx;
+    touchScrY       = cy;
+    touchTapStartX  = cx;
+    touchTapStartY  = cy;
+    touchTapMoved   = false;
   } else if (e.touches.length === 2) {
     touchPanActive  = false;
+    touchTapMoved   = true; // pinch is never a tap
     const t0 = e.touches[0], t1 = e.touches[1];
     pinchStartDist  = Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY);
     pinchStartPpm   = ppm;
@@ -738,8 +758,13 @@ function onTouchStart(e) {
 function onTouchMove(e) {
   e.preventDefault();
   if (e.touches.length === 1 && touchPanActive) {
-    const dx = e.touches[0].clientX - touchPanStartX;
-    const dy = e.touches[0].clientY - touchPanStartY;
+    const cx = e.touches[0].clientX;
+    const cy = e.touches[0].clientY;
+    touchScrX = cx;
+    touchScrY = cy;
+    const dx = cx - touchPanStartX;
+    const dy = cy - touchPanStartY;
+    if (Math.hypot(dx, dy) > 8) touchTapMoved = true;
     camX = touchPanCamX0 - dx / ppm;
     camY = touchPanCamY0 - dy / ppm;
     clampCamera();
@@ -763,13 +788,34 @@ function onTouchEnd(e) {
   e.preventDefault();
   if (e.touches.length === 0) {
     touchPanActive = false;
+    // Detect tap (no significant movement) → place object
+    if (!touchTapMoved && activeTool !== TOOL.CURSOR) {
+      const wx = screenToWorld(touchScrX, touchScrY).x;
+      const wy = screenToWorld(touchScrX, touchScrY).y;
+      const insideRoom = wx >= 0 && wx <= CFG.ROOM_W && wy >= 0 && wy <= CFG.ROOM_H;
+      if (activeTool === TOOL.LEGS && insideRoom) {
+        world.addPinnedLegPair(wx, wy);
+        dbg(`mobile placed legs at (${wx.toFixed(2)}, ${wy.toFixed(2)})`);
+      } else if (activeTool === TOOL.BAGS && insideRoom) {
+        world.addBag(wx, wy);
+        dbg(`mobile placed bag at (${wx.toFixed(2)}, ${wy.toFixed(2)})`);
+      } else if (activeTool === TOOL.PEDESTALS) {
+        world.addPedestal(wx, wy);
+        dbg(`mobile placed pedestal at (${wx.toFixed(2)}, ${wy.toFixed(2)})`);
+      }
+    }
   } else if (e.touches.length === 1) {
     // Finger lifted from a pinch — resume single-finger pan
     touchPanActive = true;
-    touchPanStartX = e.touches[0].clientX;
-    touchPanStartY = e.touches[0].clientY;
+    const cx = e.touches[0].clientX;
+    const cy = e.touches[0].clientY;
+    touchPanStartX = cx;
+    touchPanStartY = cy;
     touchPanCamX0  = camX;
     touchPanCamY0  = camY;
+    touchScrX      = cx;
+    touchScrY      = cy;
+    touchTapMoved  = true; // coming from pinch — don't treat as tap
   }
 }
 
